@@ -1,0 +1,344 @@
+"""
+Daily price update for the Groceries app.
+
+1. For each store in stores.json: download the chain's store list, find the right branch,
+   then download that branch's full price file (published by law, see gov.il "שקיפות מחירים").
+2. Combine everything into site/prices.json, which the app reads.
+3. Write site/report.json and site/index.html so you can see what happened.
+
+If a chain fails on a given day, that store keeps its prices from the last good run.
+"""
+
+import asyncio
+import glob
+import json
+import os
+import re
+
+import time
+import traceback
+import urllib.request
+from datetime import datetime, timezone
+
+from lxml import etree
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+SITE = os.path.join(ROOT, "site")
+DUMPS = os.path.join(ROOT, "dumps")
+STEP_TIMEOUT = 20 * 60  # seconds per download step
+
+log_lines = []
+
+
+def log(msg):
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    log_lines.append(line)
+
+
+# ---------------------------------------------------------------------------
+# XML reading (chains differ in tag case and layout, so match tags loosely)
+# ---------------------------------------------------------------------------
+
+def local(tag):
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def records(path, key_field):
+    """Yield {field: text} for every element that has a child named key_field."""
+    parser = etree.XMLParser(recover=True, huge_tree=True, remove_blank_text=True)
+    try:
+        tree = etree.parse(path, parser)
+    except Exception as err:  # noqa: BLE001
+        log(f"   could not read {os.path.basename(path)}: {err}")
+        return
+    root = tree.getroot()
+    if root is None:
+        return
+    for el in root.iter():
+        children = {local(c.tag): (c.text or "").strip() for c in el if len(c) == 0}
+        if key_field in children:
+            yield children
+
+
+def file_date(path):
+    """The date-time in a file name like PriceFull7290172900007-001-202410250500.xml."""
+    found = re.findall(r"(\d{12})", os.path.basename(path))
+    return found[-1] if found else "0"
+
+
+def xml_files(folder):
+    files = []
+    for ext in ("*.xml", "*.XML"):
+        files += glob.glob(os.path.join(folder, "**", ext), recursive=True)
+    return sorted(set(files))
+
+
+# ---------------------------------------------------------------------------
+# Downloading with il-supermarket-scraper
+# ---------------------------------------------------------------------------
+
+async def download(scraper_name, folder, file_type, store_id=None):
+    from il_supermarket_scarper import ScraperFactory, FileTypesFilters
+    from il_supermarket_scarper.utils import DiskFileOutput
+
+    os.makedirs(folder, exist_ok=True)
+    scraper_cls = ScraperFactory[scraper_name].value
+    scraper = scraper_cls(file_output=DiskFileOutput(folder, extract_gz=True))
+    kwargs = {"files_types": [FileTypesFilters[file_type].name]}
+    if store_id:
+        kwargs["store_id"] = int(store_id)
+
+    async def run():
+        count = 0
+        async for result in scraper.scrape(**kwargs):
+            count += 1
+            err = getattr(result, "error", None)
+            if err:
+                log(f"   download problem: {err}")
+        return count
+
+    return await asyncio.wait_for(run(), timeout=STEP_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# Finding the right branch
+# ---------------------------------------------------------------------------
+
+def norm(text):
+    return re.sub(r"[\"'׳״`.,\-()]", " ", (text or "").lower()).replace("  ", " ").strip()
+
+
+def read_stores(folder):
+    stores = {}
+    for path in xml_files(folder):
+        for rec in records(path, "storeid"):
+            sid = rec.get("storeid", "").lstrip("0") or "0"
+            stores[sid] = {
+                "id": sid,
+                "name": rec.get("storename", ""),
+                "address": rec.get("address", ""),
+                "city": rec.get("city", ""),
+            }
+    return list(stores.values())
+
+
+def choose_store(stores, target, city_terms):
+    city_terms = [norm(c) for c in city_terms]
+
+    def in_city(s):
+        city = norm(s["city"])
+        text = norm(f"{s['name']} {s['address']}")
+        return any(c and (c == city or c in city or c in text) for c in city_terms)
+
+    candidates = [s for s in stores if in_city(s)]
+    if target.get("store_id"):
+        sid = str(target["store_id"]).lstrip("0")
+        match = next((s for s in stores if s["id"] == sid), None)
+        return match, candidates, "chosen by store_id in stores.json" if match else "store_id not found"
+
+    def score(s):
+        text = norm(f"{s['name']} {s['address']}")
+        return sum(len(k) for k in target["keywords"] if norm(k) in text)
+
+    ranked = sorted(candidates, key=score, reverse=True)
+    if ranked and score(ranked[0]) > 0:
+        return ranked[0], candidates, "matched by name"
+    if len(candidates) == 1:
+        return candidates[0], candidates, "the only branch in the city"
+    return None, candidates, "no branch matched – see the list and set store_id"
+
+
+# ---------------------------------------------------------------------------
+# Reading prices
+# ---------------------------------------------------------------------------
+
+def to_price(text):
+    try:
+        value = float(text)
+        return round(value, 2) if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def read_prices(folder):
+    files = xml_files(folder)
+    full = [f for f in files if "pricefull" in os.path.basename(f).lower()] or files
+    if not full:
+        return None, {}
+    latest = max(full, key=file_date)
+    items = {}
+    for rec in records(latest, "itemcode"):
+        code = re.sub(r"\D", "", rec.get("itemcode", ""))
+        if len(code) < 7 or rec.get("itemtype", "1") == "0":
+            continue  # store-internal codes (weighed produce etc.) don't match across chains
+        price = to_price(rec.get("itemprice"))
+        if price is None:
+            continue
+        # (ManufacturerName is often the importer or the store itself, so it's not added to the name.)
+        name = rec.get("itemname", "") or rec.get("manufactureritemdescription", "")
+        items[code] = (name, price)
+    return latest, items
+
+
+# ---------------------------------------------------------------------------
+# Previous results (kept when a chain fails today)
+# ---------------------------------------------------------------------------
+
+def load_previous():
+    url = os.environ.get("PAGES_URL", "").strip()
+    if not url:
+        return None
+    url = url.rstrip("/") + "/prices.json"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            log(f"Loaded previous prices from {url}")
+            return data
+    except Exception as err:  # noqa: BLE001
+        log(f"No previous prices found ({err}) – fine on the first run.")
+        return None
+
+
+def previous_column(prev, label):
+    if not prev:
+        return None, {}
+    for idx, store in enumerate(prev.get("stores", [])):
+        if store.get("label") == label:
+            column = {}
+            for code, row in prev.get("items", {}).items():
+                prices = row[1] if len(row) > 1 else []
+                if idx < len(prices) and prices[idx] is not None:
+                    column[code] = (row[0], prices[idx])
+            return store, column
+    return None, {}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main():
+    config = json.load(open(os.path.join(HERE, "stores.json"), encoding="utf-8"))
+    prev = load_previous()
+    os.makedirs(SITE, exist_ok=True)
+
+    store_lists = {}
+    columns = []
+    report = []
+
+    for target in config["stores"]:
+        label, scraper = target["label"], target["scraper"]
+        log(f"=== {label} ({target['place']}) – {scraper}")
+        entry = {"label": label, "place": target["place"], "scraper": scraper, "ok": False}
+        started = time.time()
+        try:
+            if scraper not in store_lists:
+                folder = os.path.join(DUMPS, scraper, "stores")
+                await download(scraper, folder, "STORE_FILE")
+                store_lists[scraper] = read_stores(folder)
+                log(f"   {len(store_lists[scraper])} branches in the chain's store list")
+            stores = store_lists[scraper]
+            if not stores:
+                raise RuntimeError("could not get the chain's list of branches (maybe blocked outside Israel)")
+
+            branch, candidates, how = choose_store(stores, target, config["city"])
+            entry["branches_in_city"] = candidates
+            entry["how_chosen"] = how
+            if not branch:
+                raise RuntimeError(how)
+            entry["branch"] = branch
+            log(f"   branch: #{branch['id']} {branch['name']} – {branch['address']} ({how})")
+
+            folder = os.path.join(DUMPS, scraper, f"prices-{branch['id']}")
+            await download(scraper, folder, "PRICE_FULL_FILE", store_id=branch["id"])
+            source, items = read_prices(folder)
+            if not items:
+                raise RuntimeError("no price file found for this branch (maybe blocked outside Israel)")
+            entry.update(ok=True, items=len(items), file=os.path.basename(source), file_date=file_date(source))
+            log(f"   {len(items)} products from {os.path.basename(source)}")
+            columns.append({
+                "label": label, "place": target["place"],
+                "branch": branch["name"], "date": file_date(source), "stale": False
+            })
+            columns[-1]["_items"] = items
+        except Exception as err:  # noqa: BLE001
+            entry["error"] = str(err) or err.__class__.__name__
+            log(f"   FAILED: {entry['error']}")
+            if not isinstance(err, RuntimeError):
+                log(traceback.format_exc(limit=3))
+            old_store, old_items = previous_column(prev, label)
+            if old_items:
+                log(f"   keeping {len(old_items)} prices from {old_store.get('date')}")
+                columns.append({
+                    "label": label, "place": target["place"],
+                    "branch": old_store.get("branch", ""), "date": old_store.get("date", ""), "stale": True,
+                    "_items": old_items
+                })
+                entry["kept_previous"] = old_store.get("date")
+        entry["seconds"] = round(time.time() - started)
+        report.append(entry)
+
+    # Combine: { barcode: [name, [price per store]] }
+    combined = {}
+    for idx, col in enumerate(columns):
+        for code, (name, price) in col["_items"].items():
+            row = combined.setdefault(code, [name, [None] * len(columns)])
+            if len(name) > len(row[0]):
+                row[0] = name
+            row[1][idx] = price
+
+    out = {
+        "updated": datetime.now(timezone.utc).isoformat(timespec="minutes"),
+        "stores": [{k: v for k, v in c.items() if not k.startswith("_")} for c in columns],
+        "items": combined,
+    }
+    with open(os.path.join(SITE, "prices.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(SITE, "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"updated": out["updated"], "stores": report, "log": log_lines}, fh, ensure_ascii=False, indent=1)
+    write_status_page(out, report)
+
+    ok = sum(1 for r in report if r["ok"])
+    log(f"Done: {ok} of {len(report)} stores updated, {len(combined)} products in total.")
+    # Always finish normally, so the status page (index.html) gets published and shows what failed.
+
+
+def write_status_page(out, report):
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    rows = []
+    for r in report:
+        status = "✅ updated" if r["ok"] else ("⚠️ kept " + esc(r["kept_previous"]) if r.get("kept_previous") else "❌ failed")
+        branch = r.get("branch") or {}
+        detail = f"#{esc(branch.get('id', ''))} {esc(branch.get('name', ''))} – {esc(branch.get('address', ''))}" if branch else ""
+        extra = f"<br><small>{esc(r.get('error', ''))}</small>" if r.get("error") else ""
+        cands = "".join(
+            f"<li>#{esc(c['id'])} {esc(c['name'])} – {esc(c['address'])}</li>" for c in r.get("branches_in_city", [])
+        )
+        rows.append(
+            f"<tr><td><b>{esc(r['label'])}</b><br>{esc(r['place'])}</td><td>{status}{extra}</td>"
+            f"<td>{detail}<br><small>{esc(r.get('how_chosen', ''))}</small>"
+            f"{'<details><summary>Branches in the city</summary><ul>' + cands + '</ul></details>' if cands else ''}</td>"
+            f"<td>{esc(r.get('items', ''))}</td></tr>"
+        )
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Grocery prices</title>
+<style>body{{font:16px -apple-system,system-ui,sans-serif;margin:20px;color:#1c1c1e;background:#f8f2e8}}
+table{{border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;width:100%}}
+td,th{{padding:10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
+small{{color:#8a8a8e}}</style></head><body>
+<h1>Grocery prices</h1><p>Last update: {esc(out['updated'])} (UTC) · {len(out['items'])} products</p>
+<table><tr><th>Store</th><th>Status</th><th>Branch used</th><th>Products</th></tr>{''.join(rows)}</table>
+<p><small>The app reads <a href="prices.json">prices.json</a>. Details: <a href="report.json">report.json</a>.</small></p>
+</body></html>"""
+    with open(os.path.join(SITE, "index.html"), "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

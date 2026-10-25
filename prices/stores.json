@@ -1,0 +1,34 @@
+{
+  "_help": "Which stores to collect prices from. If the report shows the wrong branch, put its number in store_id (e.g. \"store_id\": 34).",
+  "city": ["הרצליה", "הרצלייה", "הרצליה פיתוח", "herzliya", "herzliyya", "6400"],
+  "stores": [
+    {
+      "label": "Victory",
+      "place": "7 Stars Mall",
+      "scraper": "VICTORY_NEW_SOURCE",
+      "keywords": ["שבעת הכוכבים", "7 כוכבים", "7 הכוכבים", "כוכבים", "7 stars", "seven stars"],
+      "store_id": null
+    },
+    {
+      "label": "Super-Pharm",
+      "place": "7 Stars Mall",
+      "scraper": "SUPER_PHARM",
+      "keywords": ["שבעת הכוכבים", "7 כוכבים", "7 הכוכבים", "כוכבים", "7 stars", "seven stars"],
+      "store_id": null
+    },
+    {
+      "label": "Good Pharm",
+      "place": "7 Stars Mall",
+      "scraper": "GOOD_PHARM",
+      "keywords": ["שבעת הכוכבים", "7 כוכבים", "7 הכוכבים", "כוכבים", "7 stars", "seven stars"],
+      "store_id": null
+    },
+    {
+      "label": "Fresh Market",
+      "place": "HaNadiv",
+      "scraper": "FRESH_MARKET_AND_SUPER_DOSH",
+      "keywords": ["הנדיב", "נדיב", "hanadiv", "nadiv"],
+      "store_id": null
+    }
+  ]
+}
