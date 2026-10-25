@@ -76,27 +76,101 @@ def local(tag):
     return tag.rsplit("}", 1)[-1].lower()
 
 
-def records(path, key_field):
-    """Yield {field: text} for every element that has a child named key_field."""
+_BAD_XML_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_BARE_AMP = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
+
+
+def read_text(path):
+    """The file as text, whatever its encoding (chains use UTF-8, UTF-16 or Windows-1255)."""
+    raw = open(path, "rb").read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        for enc in ("utf-8-sig", "cp1255", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    text = _BAD_XML_CHARS.sub(" ", text)
+    return _BARE_AMP.sub("&amp;", text)
+
+
+def _records_lxml(text, key_field):
+    text = re.sub(r"^\s*<\?xml[^>]*\?>", "", text)  # the encoding is already handled
     parser = etree.XMLParser(recover=True, huge_tree=True, remove_blank_text=True)
-    try:
-        tree = etree.parse(path, parser)
-    except Exception as err:  # noqa: BLE001
-        log(f"   could not read {os.path.basename(path)}: {err}")
-        return
-    root = tree.getroot()
+    root = etree.fromstring(text.encode("utf-8"), parser)
     if root is None:
-        return
+        return []
+    out = []
     for el in root.iter():
         children = {local(c.tag): (c.text or "").strip() for c in el if len(c) == 0}
         if key_field in children:
-            yield children
+            out.append(children)
+    return out
+
+
+_FIELD = re.compile(r"<([A-Za-z_][\w.-]*)(?:\s[^>]*)?>([^<]*)</\1\s*>", re.S)
+
+
+# An element whose children are all simple fields, e.g. <Item><ItemCode>…</ItemCode><ItemPrice>…</ItemPrice></Item>
+_FLAT_ELEMENT = re.compile(
+    r"<([A-Za-z_][\w.-]*)(?:\s[^>]*)?>\s*"
+    r"((?:<([A-Za-z_][\w.-]*)(?:\s[^>]*)?>[^<]*</\3\s*>\s*|<[A-Za-z_][\w.-]*(?:\s[^>]*)?/>\s*)+)"
+    r"</\1\s*>",
+    re.S,
+)
+
+
+def _records_regex(text, key_field):
+    """Forgiving fallback: find every element made of simple fields that includes key_field."""
+    out = []
+    key = re.compile(rf"<{key_field}[\s>/]", re.I)
+    for m in _FLAT_ELEMENT.finditer(text):
+        body = m.group(2)
+        if not key.search(body):
+            continue
+        fields = {name.lower(): value.strip() for name, value in _FIELD.findall(body)}
+        fields.setdefault(key_field, "")
+        out.append(fields)
+    return out
+
+
+def records(path, key_field):
+    """Every element that has a child named key_field, as {field: text}. Tolerates broken files."""
+    try:
+        text = read_text(path)
+    except Exception as err:  # noqa: BLE001
+        log(f"   could not read {os.path.basename(path)}: {err}")
+        return []
+    try:
+        found = _records_lxml(text, key_field)
+    except Exception as err:  # noqa: BLE001
+        log(f"   XML reader problem in {os.path.basename(path)}: {err}")
+        found = []
+    # If the strict reader stopped early (common with badly formed files), use the forgiving one.
+    expected = len(re.findall(rf"<{key_field}\b", text, re.I))
+    if len(found) < expected * 0.9:
+        loose = _records_regex(text, key_field)
+        if len(loose) > len(found):
+            log(f"   {os.path.basename(path)}: strict reader got {len(found)}, forgiving reader got {len(loose)}")
+            found = loose
+    return found
 
 
 def file_date(path):
-    """The date-time in a file name like PriceFull7290172900007-001-202410250500.xml."""
-    found = re.findall(r"(\d{12})", os.path.basename(path))
-    return found[-1] if found else "0"
+    """The date and time in a file name, as YYYYMMDDHHMM(SS).
+
+    Chains write it as 202410250500 or 20241025-050909 – both are understood.
+    """
+    name = os.path.basename(path)
+    # Remove the chain number first so its digits can't be mistaken for a date.
+    rest = re.sub(r"\d{13}", "", name)
+    found = re.findall(r"(20\d{2}[01]\d[0-3]\d)[-_]?(\d{4,6})?", rest)
+    if not found:
+        return "0"
+    day, time_part = found[-1]
+    return (day + (time_part or "")).ljust(14, "0")
 
 
 def xml_files(folder):
