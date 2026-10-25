@@ -295,17 +295,42 @@ def read_prices(folder, chain_id=""):
         return None, {}
     latest = max(full, key=lambda f: (file_date(f), os.path.getsize(f)))
     items = {}
-    for rec in records(latest, "itemcode"):
+    recs = records(latest, "itemcode")
+    dropped = {"short code": 0, "no price": 0}
+    for rec in recs:
         code = re.sub(r"\D", "", rec.get("itemcode", ""))
-        if len(code) < 7 or rec.get("itemtype", "1") == "0":
-            continue  # store-internal codes (weighed produce etc.) don't match across chains
+        # Real barcodes have 8+ digits. Shorter codes are the store's own (weighed produce etc.)
+        # and don't match across chains. (ItemType isn't used: some chains mark every item 0.)
+        if len(code) < 8:
+            dropped["short code"] += 1
+            continue
         price = to_price(rec.get("itemprice"))
         if price is None:
+            dropped["no price"] += 1
             continue
         # (ManufacturerName is often the importer or the store itself, so it's not added to the name.)
         name = rec.get("itemname", "") or rec.get("manufactureritemdescription", "")
         items[code] = (name, price)
+    diagnose(latest, recs, items, dropped)
     return latest, items
+
+
+def diagnose(path, recs, items, dropped):
+    """Writes what the file looked like to the log, to fix unusual chains quickly."""
+    try:
+        text = read_text(path)
+        tags = re.findall(r"<([A-Za-z_][\w.-]*)", text)
+        common = {}
+        for t in tags:
+            common[t] = common.get(t, 0) + 1
+        top = sorted(common.items(), key=lambda kv: -kv[1])[:15]
+        log(f"   read {len(recs)} records, kept {len(items)}, dropped {dropped}")
+        log(f"   most common tags: {top}")
+        log(f"   file starts with: {text[:700]!r}")
+        if recs:
+            log(f"   first record: {dict(list(recs[0].items())[:14])}")
+    except Exception as err:  # noqa: BLE001
+        log(f"   (diagnose failed: {err})")
 
 
 # ---------------------------------------------------------------------------
