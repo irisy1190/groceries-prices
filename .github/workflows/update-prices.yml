@@ -2,7 +2,7 @@ name: Update prices
 
 on:
   schedule:
-    - cron: "17 3 * * *"   # every day around 05:17–06:17 Israel time
+    - cron: "47 7 * * *"   # every day around 09:47–10:47 Israel time (Victory publishes after ~9:00)
   workflow_dispatch:         # lets you run it by hand from the Actions tab
 
 permissions:
