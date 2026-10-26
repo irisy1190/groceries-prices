@@ -350,6 +350,118 @@ def diagnose(path, recs, items, dropped):
 
 
 # ---------------------------------------------------------------------------
+# Reading sales (PromoFull files)
+# ---------------------------------------------------------------------------
+
+def _israel_today():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Jerusalem")).date()
+    except Exception:  # noqa: BLE001
+        return datetime.now().date()
+
+
+def _promo_date(text):
+    m = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", text or "")
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+    else:
+        m = re.search(r"(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})", text or "")
+        if not m:
+            return None
+        d, mo, y = (int(x) for x in m.groups())
+    try:
+        return datetime(y, mo, d).date()
+    except ValueError:
+        return None
+
+
+def _number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def promo_text(fields):
+    """A short description, e.g. '2 ב-50' as the chain wrote it, or built from the numbers."""
+    desc = re.sub(r"\s+", " ", fields.get("promotiondescription", "")).strip()
+    qty = _number(fields.get("minqty"))
+    price = _number(fields.get("discountedprice"))
+    built = ""
+    if price and price > 0:
+        shown = f"{price:g}" if price == int(price) else f"{price:.2f}"
+        built = f"{qty:g} for ₪{shown}" if qty and qty > 1 else f"₪{shown}"
+    if desc and (re.search(r"\d", desc) or not built):
+        return desc[:60]
+    return (built or desc)[:60]
+
+
+def read_promos(folder, chain_id="", store_codes=None):
+    """{barcode: [(text, end 'YYYY-MM-DD', club_only)]} for sales running today."""
+    files = [f for f in xml_files(folder) if "promo" in os.path.basename(f).lower()]
+    if chain_id:
+        same_chain = [f for f in files if chain_id in os.path.basename(f)]
+        files = same_chain or files
+    if not files:
+        log("   no sale file found")
+        return {}
+    latest = max(files, key=lambda f: (file_date(f), os.path.getsize(f)))
+    log(f"   sales file: {os.path.basename(latest)} ({os.path.getsize(latest) // 1024} KB)")
+    try:
+        text = re.sub(r"^\s*<\?xml[^>]*\?>", "", read_text(latest))
+        root = etree.fromstring(text.encode("utf-8"), etree.XMLParser(recover=True, huge_tree=True))
+    except Exception as err:  # noqa: BLE001
+        log(f"   could not read the sales file: {err}")
+        return {}
+    if root is None:
+        return {}
+
+    today = _israel_today()
+    promos = {}
+    seen = skipped_dates = 0
+    for el in root.iter():
+        kids = [c for c in el if isinstance(c.tag, str)]
+        if not any(local(c.tag) == "promotiondescription" for c in kids):
+            continue
+        seen += 1
+        fields = {local(c.tag): (c.text or "").strip() for c in kids if len(c) == 0}
+        start = _promo_date(fields.get("promotionstartdate"))
+        end = _promo_date(fields.get("promotionenddate"))
+        if (start and start > today) or (end and end < today):
+            skipped_dates += 1
+            continue
+        clubs = [(c.text or "").strip() for c in el.iter() if local(c.tag) == "clubid"]
+        club_only = any(c not in ("", "0") for c in clubs) and "0" not in clubs
+        if fields.get("additionaliscoupon") == "1":
+            club_only = True
+        label = promo_text(fields)
+        if not label:
+            continue
+        # Items: either nested <PromotionItems><Item>… or a flat row with its own <ItemCode>.
+        codes = []
+        for item in el.iter():
+            sub = {local(c.tag): (c.text or "").strip() for c in item if isinstance(c.tag, str) and len(c) == 0}
+            if "itemcode" in sub and sub.get("isgiftitem", "0") != "1":
+                codes.append(re.sub(r"\D", "", sub["itemcode"]))
+        entry = (label, end.isoformat() if end else "", club_only)
+        for code in codes:
+            if len(code) < 8 or (store_codes is not None and code not in store_codes):
+                continue
+            lst = promos.setdefault(code, [])
+            if entry not in lst:
+                lst.append(entry)
+    # Keep the two most useful sales per product (everyone's sales before club-only ones).
+    for code, lst in promos.items():
+        lst.sort(key=lambda e: (e[2], e[1] or "9999"))
+        del lst[2:]
+    log(f"   {seen} sale records, {skipped_dates} not running today, {len(promos)} products on sale")
+    if seen == 0:
+        log(f"   sales file starts with: {text[:500]!r}")
+    return promos
+
+
+# ---------------------------------------------------------------------------
 # Previous results (kept when a chain fails today)
 # ---------------------------------------------------------------------------
 
@@ -380,6 +492,27 @@ def previous_column(prev, label):
                     column[code] = (row[0], prices[idx])
             return store, column
     return None, {}
+
+
+def previous_promos(prev, label):
+    """Sales for this store from an earlier prices.json, minus those that have ended."""
+    if not prev:
+        return {}
+    stores = prev.get("stores", [])
+    idx = next((i for i, st in enumerate(stores) if st.get("label") == label), None)
+    if idx is None:
+        return {}
+    today = _israel_today().isoformat()
+    table = prev.get("promos", [])
+    out = {}
+    for code, ids in prev.get("itemPromos", {}).items():
+        for i in ids:
+            if i < len(table) and table[i][0] == idx:
+                _, text, end, club = table[i]
+                if end and end < today:
+                    continue
+                out.setdefault(code, []).append((text, end, bool(club)))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +571,10 @@ async def main():
         if target.get("source") == "mac":
             # This chain blocks computers outside Israel: its prices come from the Mac.
             store, items = previous_column(mac, label)
+            promos = previous_promos(mac, label)
             if not items:
                 store, items = previous_column(prev, label)
+                promos = previous_promos(prev, label)
                 stale = True
                 how = "kept from the last run (no prices from the Mac)"
             else:
@@ -448,9 +583,9 @@ async def main():
             if items:
                 columns.append({
                     "label": label, "place": target["place"], "branch": store.get("branch", ""),
-                    "date": store.get("date", ""), "stale": stale, "_items": items
+                    "date": store.get("date", ""), "stale": stale, "_items": items, "_promos": promos
                 })
-                entry.update(ok=not stale, items=len(items), how_chosen=how, file_date=store.get("date", ""),
+                entry.update(ok=not stale, items=len(items), promos=len(promos), how_chosen=how, file_date=store.get("date", ""),
                              branch={"id": "", "name": store.get("branch", ""), "address": ""})
                 if stale:
                     entry["kept_previous"] = store.get("date", "")
@@ -500,6 +635,20 @@ async def main():
                 "branch": branch["name"], "date": file_date(source), "stale": False
             })
             columns[-1]["_items"] = items
+            # Today's sales for this branch (a problem here never loses the prices).
+            try:
+                promo_folder = os.path.join(DUMPS, scraper, f"promos-{branch['id']}")
+                await download(scraper, promo_folder, "PROMO_FULL_FILE", store_id=branch["id"])
+                promos = read_promos(promo_folder, branch.get("chain", ""), set(items))
+            except Exception as err:  # noqa: BLE001
+                log(f"   sales download problem: {err!r}")
+                promos = {}
+            if not promos:
+                promos = previous_promos(prev, label)
+                if promos:
+                    log(f"   keeping {len(promos)} sales from the last run")
+            columns[-1]["_promos"] = promos
+            entry["promos"] = len(promos)
         except Exception as err:  # noqa: BLE001
             entry["error"] = str(err) or err.__class__.__name__
             log(f"   FAILED: {entry['error']}")
@@ -511,7 +660,7 @@ async def main():
                 columns.append({
                     "label": label, "place": target["place"],
                     "branch": old_store.get("branch", ""), "date": old_store.get("date", ""), "stale": True,
-                    "_items": old_items
+                    "_items": old_items, "_promos": previous_promos(prev, label)
                 })
                 entry["kept_previous"] = old_store.get("date")
         entry["seconds"] = round(time.time() - started)
@@ -528,10 +677,25 @@ async def main():
                 row[0] = name
             row[1][idx] = price
 
+    # Sales: a shared table [store index, text, end date, club only] and, per barcode, which rows apply.
+    promo_table, promo_index, item_promos = [], {}, {}
+    for idx, col in enumerate(columns):
+        for code, entries in col.get("_promos", {}).items():
+            if code not in combined:
+                continue
+            for text, end, club in entries:
+                key = (idx, text, end, bool(club))
+                if key not in promo_index:
+                    promo_index[key] = len(promo_table)
+                    promo_table.append([idx, text, end, 1 if club else 0])
+                item_promos.setdefault(code, []).append(promo_index[key])
+
     out = {
         "updated": datetime.now(timezone.utc).isoformat(timespec="minutes"),
         "stores": [{k: v for k, v in c.items() if not k.startswith("_")} for c in columns],
         "items": combined,
+        "promos": promo_table,
+        "itemPromos": item_promos,
     }
     with open(os.path.join(SITE, "prices.json"), "w", encoding="utf-8") as fh:
         json.dump(out, fh, ensure_ascii=False, separators=(",", ":"))
@@ -540,7 +704,7 @@ async def main():
     write_status_page(out, report)
 
     ok = sum(1 for r in report if r["ok"])
-    log(f"Done: {ok} of {len(report)} stores updated, {len(combined)} products in total.")
+    log(f"Done: {ok} of {len(report)} stores updated, {len(combined)} products in total, {len(item_promos)} on sale.")
     # Always finish normally, so the status page (index.html) gets published and shows what failed.
 
 
@@ -564,7 +728,7 @@ def write_status_page(out, report):
             f"<tr><td><b>{esc(r['label'])}</b><br>{esc(r['place'])}</td><td>{status}{extra}</td>"
             f"<td>{detail}<br><small>{esc(r.get('how_chosen', ''))}</small>"
             f"{'<details><summary>Branches in the city</summary><ul>' + cands + '</ul></details>' if cands else ''}</td>"
-            f"<td>{esc(r.get('items', ''))}</td></tr>"
+            f"<td>{esc(r.get('items', ''))}</td><td>{esc(r.get('promos', ''))}</td></tr>"
         )
     html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Grocery prices</title>
@@ -573,7 +737,7 @@ table{{border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidd
 td,th{{padding:10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
 small{{color:#8a8a8e}}</style></head><body>
 <h1>Grocery prices</h1><p>Last update: {esc(out['updated'])} (UTC) · {len(out['items'])} products</p>
-<table><tr><th>Store</th><th>Status</th><th>Branch used</th><th>Products</th></tr>{''.join(rows)}</table>
+<table><tr><th>Store</th><th>Status</th><th>Branch used</th><th>Products</th><th>On sale</th></tr>{''.join(rows)}</table>
 <p><small>The app reads <a href="prices.json">prices.json</a>. Details: <a href="report.json">report.json</a>.</small></p>
 </body></html>"""
     with open(os.path.join(SITE, "index.html"), "w", encoding="utf-8") as fh:
