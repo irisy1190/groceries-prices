@@ -22,6 +22,22 @@ from datetime import datetime, timezone
 
 from lxml import etree
 
+# macOS's built-in Python (3.9) lacks anext(), which the price tool uses.
+import builtins
+
+if not hasattr(builtins, "anext"):
+    _missing = object()
+
+    async def _anext(iterator, default=_missing):
+        try:
+            return await iterator.__anext__()
+        except StopAsyncIteration:
+            if default is _missing:
+                raise
+            return default
+
+    builtins.anext = _anext
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SITE = os.path.join(ROOT, "site")
