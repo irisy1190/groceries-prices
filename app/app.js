@@ -104,14 +104,13 @@ const state = {
   known: {},
   knownLoaded: false,
   history: [],
-  lastAction: null,
+  undoStack: [],     // every change you made this session, newest last
   newCategory: FALLBACK,
   focused: false,
   collapsed: loadCollapsed(),
   itemOrder: {}      // { category: [itemKey, ...] } — the order you dragged items into
 };
 
-let undoTimer = null;
 const photoCache = new Map();
 
 // ---------------------------------------------------------------------------
@@ -273,7 +272,7 @@ function stopListening() {
 function resetState() {
   Object.assign(state, {
     household: null, ready: false, items: [], custom: [], order: [], styles: {},
-    known: {}, knownLoaded: false, history: [], lastAction: null,
+    known: {}, knownLoaded: false, history: [], undoStack: [],
     itemOrder: {}
   });
   photoCache.clear();
@@ -433,20 +432,20 @@ const byUsefulness = (a, b) =>
   (b.isFavorite - a.isFavorite) || (b.count - a.count) || (b.lastUsed - a.lastUsed) ||
   a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
 
-/** Every item you've ever added whose name contains what you typed (not ones already on the list). */
-function suggestions(text) {
+/** Items you've added before to this category whose name contains what you typed (not ones already on the list). */
+function suggestions(text, category) {
   const q = keyFor(text);
   if (!q) return [];
   const open = openNames();
   return Object.values(state.known)
-    .filter(k => k.id.includes(q) && !open.has(k.id))
+    .filter(k => k.id.includes(q) && !open.has(k.id) && (!category || k.category === category))
     .sort((a, b) => (b.id.startsWith(q) - a.id.startsWith(q)) || byUsefulness(a, b));
 }
 
-/** With the box empty: everything you've ever added, favorites first (scroll the row sideways). */
-function favoritesToAdd() {
+/** With the box empty: everything you've added to this category, favorites first (scroll the row sideways). */
+function favoritesToAdd(category) {
   const open = openNames();
-  return Object.values(state.known).filter(k => !open.has(k.id)).sort(byUsefulness);
+  return Object.values(state.known).filter(k => !open.has(k.id) && (!category || k.category === category)).sort(byUsefulness);
 }
 
 /** One time: items from History (bought, deleted…) that autocomplete never learned. */
@@ -1230,22 +1229,21 @@ function actionMessage(a) {
     case 'toggled': return a.item.isChecked ? `Unchecked ${a.item.name}` : `Checked ${a.item.name}`;
     case 'deleted': return `Deleted ${a.item.name}`;
     case 'moved': return `Moved ${a.item.name} to ${catName(a.to)}`;
+    case 'edited': return `Renamed to ${a.newName}`;
     case 'cleared': return `Cleared ${a.items.length} item${a.items.length === 1 ? '' : 's'}`;
   }
   return '';
 }
 
+/** Remember a change so Undo can reverse it (all of this session's changes, newest first). */
 function register(action) {
-  state.lastAction = action;
-  clearTimeout(undoTimer);
-  undoTimer = setTimeout(() => {
-    if (state.lastAction === action) { state.lastAction = null; renderBottom(); }
-  }, 4000);
+  state.undoStack.push(action);
+  if (state.undoStack.length > 100) state.undoStack.shift();
   renderBottom();
 }
 
 function undo() {
-  const a = state.lastAction;
+  const a = state.undoStack.pop();
   if (!a) return;
   if (a.type === 'added') {
     deleteDoc(itemRef(a.item.id));
@@ -1257,8 +1255,6 @@ function undo() {
     setDoc(itemRef(a.item.id), itemData(a.item));
   }
   setDoc(doc(historyCol), { action: 'undo', name: actionMessage(a), category: '', ...byMe(), date: Timestamp.now() });
-  clearTimeout(undoTimer);
-  state.lastAction = null;
   renderBottom();
 }
 
@@ -1393,6 +1389,7 @@ function renderAll() {
 
 function renderList() {
   if (!state.ready || drag) return;
+  if (document.activeElement?.matches?.('.inline-name')) return; // redrawn when the rename finishes
   const secs = sections();
   const hint = state.items.length ? '' : `<div class="empty small"><h3>Your list is empty</h3>Tap + next to a category to add an item.</div>`;
   const html = hint + secs.map(s => {
@@ -1417,6 +1414,7 @@ function renderList() {
     temp.innerHTML = html;
     const liveSec = liveRow.closest('section');
     const newSec = [...temp.children].find(el => el.matches('section') && el.dataset.cat === liveSec.dataset.cat);
+    const rowTopBefore = liveRow.getBoundingClientRect().top;
     if (newSec) {
       liveSec.className = newSec.className;
       liveSec.querySelector('.cat-head').replaceWith(newSec.querySelector('.cat-head'));
@@ -1429,6 +1427,9 @@ function renderList() {
         if (el === newSec) { before = false; continue; }
         if (before) listEl.insertBefore(el, liveSec); else listEl.append(el);
       }
+      // Keep the typing row exactly where it was on screen (the list scrolls instead), so nothing jumps.
+      const shift = liveRow.getBoundingClientRect().top - rowTopBefore;
+      if (Math.abs(shift) > 1) window.scrollBy(0, shift);
       loadThumbs();
       return;
     }
@@ -1484,7 +1485,7 @@ listEl.addEventListener('pointerdown', e => {
   }
   // Long press anywhere on an item (not its ⋯ button or photo) picks it up.
   const row = e.target.closest('.row');
-  if (!row || e.target.closest('.more, .thumb') || e.button > 0) return;
+  if (!row || e.target.closest('.more, .thumb, .inline-name') || e.button > 0) return;
   cancelPress();
   press = { x: e.clientX, y: e.clientY, row, pointerId: e.pointerId };
   press.timer = setTimeout(() => {
@@ -1605,7 +1606,7 @@ function moveDrag(clientY) {
 function autoScroll() {
   if (!drag) return;
   const y = drag.lastClientY;
-  const bottomLimit = window.innerHeight - ($('#bottom').offsetHeight || 0) - 30;
+  const bottomLimit = window.innerHeight - 30;
   let step = 0;
   if (y < 140) step = -10;
   else if (y > bottomLimit) step = 10;
@@ -1686,8 +1687,43 @@ listEl.addEventListener('click', e => {
     const src = e.target.closest('.thumb').src;
     if (src) return openViewer(src);
   }
-  toggleItem(item);
+  if (e.target.closest('.inline-name')) return;
+  if (e.target.closest('.check')) return toggleItem(item);
+  if (e.target.closest('.txt')) return startRename(row, item);
 });
+
+/** Tap an item's name to change it right there (quantity, note and photo stay in ⋯ → Edit). */
+function startRename(row, item) {
+  const span = row.querySelector('.name-text');
+  if (!span || row.querySelector('.inline-name')) return;
+  const inp = document.createElement('input');
+  inp.className = 'inline-name';
+  inp.value = item.name;
+  inp.dir = 'auto';
+  inp.setAttribute('enterkeyhint', 'done');
+  inp.setAttribute('autocomplete', 'off');
+  span.replaceWith(inp);
+  inp.focus();
+  const end = inp.value.length;
+  try { inp.setSelectionRange(end, end); } catch {}
+  let done = false;
+  const finish = save => {
+    if (done) return;
+    done = true;
+    const name = trim(inp.value);
+    const current = state.items.find(i => i.id === item.id);
+    if (save && name && current && name !== current.name) {
+      updateItem({ ...current, name });
+      register({ type: 'edited', item: current, newName: name });
+    }
+    renderList();
+  };
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
+    if (e.key === 'Escape') { finish(false); }
+  });
+  inp.addEventListener('blur', () => finish(true));
+}
 
 // ---------------------------------------------------------------------------
 // Adding items: tap + on a category, type in the new row that opens there
@@ -1702,15 +1738,42 @@ function startAdding(category) {
   state.newCategory = category;
   state.collapsed.delete(category);
   saveCollapsed();
+  document.body.classList.add('adding');
   renderList();
   const inp = addInput();
-  if (inp) {
-    inp.focus();
-    inp.closest('.add-row').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  }
+  if (inp) inp.focus();
   renderAddSuggestions();
   renderBottom();
+  // The keyboard takes a moment to open: adjust once, after it has settled.
+  settleThenShow(700);
 }
+
+let settleTimer = null;
+/** Wait until the screen stops changing size (the keyboard opening), then position the row once. */
+function settleThenShow(fallbackMs = 250) {
+  clearTimeout(settleTimer);
+  settleTimer = setTimeout(keepAddRowVisible, fallbackMs);
+}
+
+/** Only if the typing row (with its suggestions) is hidden: scroll it to about a third of the space above the keyboard. */
+function keepAddRowVisible() {
+  const row = listEl.querySelector('.add-row');
+  if (!row || !state.adding) return;
+  const vv = window.visualViewport;
+  const headerBottom = $('header')?.getBoundingClientRect().bottom || 0;
+  const viewTop = Math.max(vv ? vv.offsetTop : 0, headerBottom);       // below the sticky title
+  const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight; // above the keyboard
+  const sugg = row.nextElementSibling?.matches('.add-sugg') && row.nextElementSibling.childElementCount ? row.nextElementSibling : null;
+  const top = row.getBoundingClientRect().top;
+  const bottom = (sugg || row).getBoundingClientRect().bottom;
+  // Too close to the keyboard (or under the title) counts as hidden: give it room to breathe.
+  const hidden = bottom > viewBottom - 70 || top < viewTop + 8;
+  if (!hidden) return; // already visible: don't move anything
+  const target = viewTop + (viewBottom - viewTop) * 0.33;
+  window.scrollBy(0, top - target);
+}
+// Each size change restarts the wait, so the row moves once the keyboard is fully open.
+window.visualViewport?.addEventListener('resize', () => { if (state.adding) settleThenShow(180); });
 
 /** Add what's typed (if anything) to the open category. */
 function commitAdd(text) {
@@ -1725,6 +1788,7 @@ function stopAdding() {
   if (!state.adding) return;
   commitAdd();
   state.adding = null;
+  document.body.classList.remove('adding');
   renderList();
   renderBottom();
 }
@@ -1734,32 +1798,26 @@ function renderAddSuggestions() {
   const inp = addInput();
   if (!box || !inp) return;
   const typed = !!trim(inp.value);
-  const list = typed ? suggestions(inp.value) : favoritesToAdd();
+  const list = typed ? suggestions(inp.value, state.adding) : favoritesToAdd(state.adding);
   box.innerHTML = list.map(k =>
     `<button class="chip sugg" data-known="${esc(k.id)}" style="border-color:color-mix(in srgb, ${catColor(k.category)} 40%, transparent)">
       ${emoji(catIconName(k.category))} ${esc(k.name)}${k.isFavorite ? ' <span class="star">★</span>' : ''}
     </button>`).join('');
 }
 
+/** The Undo and Clear bought buttons under the title. */
 function renderBottom() {
-  const a = state.lastAction;
-  const toast = $('#toast');
-  toast.hidden = !a;
-  if (a) $('#toastMsg').textContent = actionMessage(a);
-
+  const stack = state.undoStack;
+  const a = stack.at(-1);
+  $('#undoBtn').disabled = !a;
+  $('#undoWhat').textContent = a ? actionMessage(a) + (stack.length > 1 ? ` · ${stack.length - 1} more` : '') : '';
   const checked = state.items.filter(i => i.isChecked).length;
-  const showClear = checked > 0 && !a && !state.adding;
-  $('#clearWrap').hidden = !showClear;
-  $('#clearBtn').textContent = `✓ Clear ${checked} bought`;
-  requestAnimationFrame(updateBottomHeight);
-}
-
-function updateBottomHeight() {
-  document.documentElement.style.setProperty('--bottom-h', `${$('#bottom').offsetHeight}px`);
+  $('#clearBtn').disabled = !checked;
+  $('#clearLabel').textContent = checked ? `Clear ${checked} bought` : 'Clear bought';
 }
 
 // Typing in the new row
-listEl.addEventListener('input', e => { if (e.target.matches('.add-input')) renderAddSuggestions(); });
+listEl.addEventListener('input', e => { if (e.target.matches('.add-input')) { renderAddSuggestions(); keepAddRowVisible(); } });
 listEl.addEventListener('keydown', e => {
   if (!e.target.matches('.add-input') || e.key !== 'Enter') return;
   e.preventDefault();
@@ -1791,6 +1849,7 @@ listEl.addEventListener('click', e => {
     commitAdd();
     state.scanningFor = cat;
     state.adding = null;
+    document.body.classList.remove('adding');
     renderList();
     renderBottom();
     state.scanningFor = null;
@@ -2720,7 +2779,6 @@ function openHouseholdSettings() {
 // ---------------------------------------------------------------------------
 
 renderBottom();
-new ResizeObserver(updateBottomHeight).observe($('#bottom'));
 
 if (firebaseConfig.apiKey === 'PASTE-HERE') {
   listEl.innerHTML = `<div class="empty"><div class="big">🔧</div><h3>Almost there</h3>Paste your Firebase web settings into <b>config.js</b> (see the setup guide).</div>`;

@@ -24,7 +24,7 @@
     --accent: #3D9E73;
     --danger: #FF3B30;
     --shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
-    --bottom-h: 180px;
+    --bottom-h: 0px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -62,6 +62,17 @@
     -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
   }
   .toolbar { display: flex; align-items: center; justify-content: space-between; height: 44px; }
+  .actionbar { display: flex; gap: 8px; margin: 8px 0 2px; }
+  .act-btn {
+    flex: 1 1 0; min-width: 0; display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-radius: 14px; background: var(--card); box-shadow: var(--shadow);
+    color: var(--accent); font-weight: 600; font-size: 15px; text-align: left;
+  }
+  .act-btn svg { width: 18px; height: 18px; flex: none; }
+  .act-btn:disabled { color: var(--muted); opacity: 0.55; box-shadow: none; }
+  .act-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+  .act-text small { font-size: 12px; font-weight: 400; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .act-text small:empty { display: none; }
   .toolbar .group { display: flex; gap: 6px; }
   .icon-btn {
     width: 40px; height: 40px; border-radius: 20px;
@@ -95,6 +106,9 @@
   .empty-cat .cat-name { opacity: 0.6; }
   .empty-cat .badge { opacity: 0.55; }
   .empty.small { padding: 18px 20px 4px; }
+  /* Room to scroll the last category above the keyboard while adding. */
+  body.adding main { padding-bottom: 60vh; }
+  html { overflow-anchor: none; } /* the app keeps the typing row in place itself (same on iPhone and elsewhere) */
   .add-row { display: flex; align-items: center; gap: 12px; padding: 7px 6px 7px 14px; min-height: 56px; position: relative; }
   .card > .row + .add-row::before {
     content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px;
@@ -133,6 +147,13 @@
     transition: background 0.15s, border-color 0.15s;
   }
   .row.checked .check { background: var(--accent); border-color: var(--accent); }
+  .check { position: relative; cursor: pointer; }
+  .check::after { content: ''; position: absolute; inset: -14px -12px; } /* a bigger area to tap */
+  .inline-name {
+    font: inherit; font-weight: 500; color: var(--text); width: 100%; min-width: 0;
+    background: var(--soft); border: 0; outline: 0; border-radius: 8px; padding: 4px 8px; margin: -4px -8px;
+    unicode-bidi: plaintext;
+  }
   .txt { flex: 1; min-width: 0; }
   .name { font-weight: 500; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .row.checked .name, .row.checked .note { color: var(--muted); }
@@ -448,16 +469,21 @@
       </div>
     </div>
     <h1 id="title">Groceries</h1>
+    <div class="actionbar">
+      <button class="act-btn" id="undoBtn" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+        <span class="act-text"><span>Undo</span><small id="undoWhat"></small></span>
+      </button>
+      <button class="act-btn" id="clearBtn" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+        <span class="act-text"><span id="clearLabel">Clear bought</span></span>
+      </button>
+    </div>
   </header>
 
   <div id="gate" hidden></div>
 
   <main id="list"><div class="loading">Loading…</div></main>
-
-  <div id="bottom">
-    <div class="toast" id="toast" hidden><span id="toastMsg"></span><button id="undoBtn">Undo</button></div>
-    <div class="clear-wrap" id="clearWrap" hidden><button class="pill" id="clearBtn"></button></div>
-  </div>
 
   <script type="module" src="app.js"></script>
   <script>
