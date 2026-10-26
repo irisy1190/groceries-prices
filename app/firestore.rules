@@ -1,0 +1,62 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function listDoc(listId) {
+      return get(/databases/$(database)/documents/lists/$(listId));
+    }
+
+    function isMember(listId) {
+      return signedIn() && request.auth.uid in listDoc(listId).data.members;
+    }
+
+    // Each person's own record: which household they're in.
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    // Invite codes. You can look one up only if you know the exact code.
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if isMember(request.resource.data.householdId);
+      allow delete: if isMember(resource.data.householdId);
+    }
+
+    match /lists/{listId} {
+      // Members see and change their household.
+      allow read: if isMember(listId);
+      allow update: if isMember(listId) || joiningWithCode(listId) || claimingOldList(listId);
+
+      // Anyone signed in can start a new household, with only themselves in it.
+      allow create: if signedIn() && request.resource.data.members == [request.auth.uid];
+
+      // Joining: you may add only yourself, and only with a valid invite code for this household.
+      function joiningWithCode(listId) {
+        return signedIn()
+          && ('members' in resource.data)
+          && !(request.auth.uid in resource.data.members)
+          && request.resource.data.members == resource.data.members.concat([request.auth.uid])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members', 'memberInfo', 'lastJoinCode'])
+          && get(/databases/$(database)/documents/invites/$(request.resource.data.lastJoinCode)).data.householdId == listId;
+      }
+
+      // One time only: the list from before accounts ("home") can be claimed while it has no members.
+      function claimingOldList(listId) {
+        return listId == 'home'
+          && signedIn()
+          && !('members' in resource.data)
+          && request.resource.data.members == [request.auth.uid];
+      }
+
+      // Everything inside a household (items, history, favorites, photos): members only.
+      match /{rest=**} {
+        allow read, write: if isMember(listId);
+      }
+    }
+  }
+}

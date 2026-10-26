@@ -1,0 +1,14 @@
+{
+  "name": "Groceries",
+  "short_name": "Groceries",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F8F2E8",
+  "theme_color": "#F8F2E8",
+  "icons": [
+    { "src": "apple-touch-icon.png?v=3", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-192.png?v=3", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png?v=3", "sizes": "512x512", "type": "image/png" }
+  ]
+}
