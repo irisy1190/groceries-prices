@@ -210,6 +210,7 @@ function categories() {
   return [...ordered, ...all.filter(c => !ordered.includes(c))];
 }
 
+/** Every category in your order (empty ones too, so each has a +), then any others that have items. */
 function sections() {
   const order = categories();
   const extra = [...new Set(state.items.map(i => i.category))].filter(c => !order.includes(c)).sort();
@@ -230,7 +231,7 @@ function sections() {
           })
       };
     })
-    .filter(s => s.items.length);
+    
 }
 
 // ---------------------------------------------------------------------------
@@ -345,14 +346,16 @@ function start(id) {
         category: k.category ?? FALLBACK,
         count: Number(k.count ?? 0),
         isFavorite: !!k.isFavorite,
-        barcode: k.barcode || ''
+        barcode: k.barcode || '',
+        lastUsed: k.lastUsed?.toMillis?.() ?? 0
       };
     }
     state.known = known;
     state.knownLoaded = true;
     learnUnknownItems();
-    renderSuggestions();
+    if (!d.historyLearned && !learningHistory) { learningHistory = true; learnFromHistory(); }
     renderList();
+    renderAddSuggestions();
   }, onError));
 
   unsubscribers.push(onSnapshot(orderRef, snap => {
@@ -395,6 +398,8 @@ function parseHistory(d) {
     category: h.category ?? FALLBACK,
     quantity: h.quantity ?? '',
     note: h.note ?? '',
+    by: typeof h.by === 'string' ? h.by : '',
+    byName: typeof h.byName === 'string' ? h.byName : '',
     date: h.date?.toDate?.() ?? new Date()
   };
 }
@@ -423,27 +428,43 @@ async function maybeCleanOldHistory() {
 
 const openNames = () => new Set(state.items.filter(i => !i.isChecked).map(i => keyFor(i.name)));
 
+// Favorites first, then what you buy most, then most recent.
+const byUsefulness = (a, b) =>
+  (b.isFavorite - a.isFavorite) || (b.count - a.count) || (b.lastUsed - a.lastUsed) ||
+  a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+
+/** Every item you've ever added whose name contains what you typed (not ones already on the list). */
 function suggestions(text) {
   const q = keyFor(text);
   if (!q) return [];
   const open = openNames();
   return Object.values(state.known)
     .filter(k => k.id.includes(q) && !open.has(k.id))
-    .sort((a, b) => {
-      const ap = a.id.startsWith(q), bp = b.id.startsWith(q);
-      if (ap !== bp) return ap ? -1 : 1;
-      if (a.isFavorite !== b.isFavorite) return a.isFavorite ? -1 : 1;
-      if (a.count !== b.count) return b.count - a.count;
-      return a.name.localeCompare(b.name);
-    })
-    .slice(0, 8);
+    .sort((a, b) => (b.id.startsWith(q) - a.id.startsWith(q)) || byUsefulness(a, b));
 }
 
+/** With the box empty: everything you've ever added, favorites first (scroll the row sideways). */
 function favoritesToAdd() {
   const open = openNames();
-  return Object.values(state.known)
-    .filter(k => k.isFavorite && !open.has(k.id))
-    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  return Object.values(state.known).filter(k => !open.has(k.id)).sort(byUsefulness);
+}
+
+/** One time: items from History (bought, deleted…) that autocomplete never learned. */
+let learningHistory = false;
+async function learnFromHistory() {
+  try {
+    const snap = await getDocs(query(historyCol, orderBy('date', 'desc'), limit(500)));
+    const items = {};
+    for (const d of snap.docs) {
+      const h = parseHistory(d);
+      if (!h || h.action === 'undo') continue;
+      const key = keyFor(h.name);
+      if (validKey(key) && !state.known[key] && !items[key]) items[key] = { name: h.name, category: h.category };
+    }
+    await setDoc(knownRef, { items, historyLearned: true }, { merge: true });
+  } catch {
+    learningHistory = false;
+  }
 }
 
 const knownCategory = name => state.known[keyFor(name)]?.category;
@@ -495,8 +516,21 @@ function logData(action, item) {
     category: item.category,
     quantity: item.quantity || '',
     note: item.note || '',
+    ...byMe(),
     date: Timestamp.now()
   };
+}
+
+/** Who did it – saved with each history entry. */
+function byMe() {
+  return { by: state.user?.uid || '', byName: displayName() };
+}
+
+/** "You", or the member's current name (falls back to the name saved at the time). */
+function whoDid(h) {
+  if (!h.by && !h.byName) return '';
+  if (h.by && h.by === state.user?.uid) return 'You';
+  return state.household?.memberInfo?.[h.by]?.name || h.byName || '';
 }
 
 const log = (action, item) => setDoc(doc(historyCol), logData(action, item));
@@ -851,20 +885,20 @@ function openPriceSheet(code) {
 }
 
 /** Scan → known product: add it right away. New product: open the editor with what we found. */
-function scanToAdd() {
+function scanToAdd(category = null) {
   openScanner(async code => {
     const known = findKnownByBarcode(code);
     if (known && isOnList(known.name)) return showNotice(`${known.name} is already on the list.`);
     const local = pricesUrl() ? await priceLookup(code).catch(() => null) : null;
     if (known) {
-      chooseWhereToBuy(local, known.category, (note, cat) => addItem(known.name, cat, '', note, code));
+      chooseWhereToBuy(local, category || known.category, (note, cat) => addItem(known.name, cat, '', note, code));
       return;
     }
     showNotice('Looking up the product…');
     // Your stores' price files have the Hebrew product name; otherwise try the online database.
     const found = local ? { name: local.name, quantity: '' } : await lookupBarcode(code);
     hideNotice();
-    chooseWhereToBuy(local, state.newCategory, (note, cat) => openEditor(null, found?.name || '', cat, {
+    chooseWhereToBuy(local, category || state.newCategory, (note, cat) => openEditor(null, found?.name || '', cat, {
       barcode: code,
       quantity: found?.quantity || '',
       note,
@@ -1222,7 +1256,7 @@ function undo() {
   } else {
     setDoc(itemRef(a.item.id), itemData(a.item));
   }
-  setDoc(doc(historyCol), { action: 'undo', name: actionMessage(a), category: '', date: Timestamp.now() });
+  setDoc(doc(historyCol), { action: 'undo', name: actionMessage(a), category: '', ...byMe(), date: Timestamp.now() });
   clearTimeout(undoTimer);
   state.lastAction = null;
   renderBottom();
@@ -1300,16 +1334,6 @@ function removeCategory(name) {
   setDoc(listRef, { categories: arrayRemove(name) }, { merge: true });
 }
 
-function moveCategory(index, delta) {
-  const order = categories();
-  const to = index + delta;
-  if (to < 0 || to >= order.length) return;
-  [order[index], order[to]] = [order[to], order[index]];
-  state.order = order;
-  setDoc(listRef, { categoryOrder: order }, { merge: true });
-  renderAll();
-}
-
 function setStyle(category, color, icon) {
   state.styles[category] = { color, icon };
   setDoc(listRef, { categoryStyles: { [category]: { color, icon } } }, { merge: true });
@@ -1364,33 +1388,71 @@ const listEl = $('#list');
 
 function renderAll() {
   renderList();
-  renderChips();
-  renderSuggestions();
   renderBottom();
 }
 
 function renderList() {
   if (!state.ready || drag) return;
   const secs = sections();
-  if (!secs.length) {
-    listEl.innerHTML = `<div class="empty"><div class="big">🧺</div><h3>Your list is empty</h3>Add your first item below.</div>`;
-    return;
-  }
-  listEl.innerHTML = secs.map(s => {
-    const collapsed = state.collapsed.has(s.category);
+  const hint = state.items.length ? '' : `<div class="empty small"><h3>Your list is empty</h3>Tap + next to a category to add an item.</div>`;
+  const html = hint + secs.map(s => {
+    const adding = state.adding === s.category;
+    const collapsed = state.collapsed.has(s.category) && !adding;
+    const empty = !s.items.length;
     const left = s.items.filter(i => !i.isChecked).length;
-    const count = left === 0 ? `<span class="count done">✓ Done</span>` : `<span class="count">${left} left</span>`;
-    const rows = collapsed ? '' : `<div class="card" data-cat="${esc(s.category)}">${s.items.map(rowHTML).join('')}</div>`;
-    return `<section class="cat ${collapsed ? 'collapsed' : ''}">
+    const count = empty ? '' : left === 0 ? `<span class="count done">✓ Done</span>` : `<span class="count">${left} left</span>`;
+    const addRow = adding ? addRowHTML(s.category) : '';
+    const rows = collapsed || (empty && !adding) ? ''
+      : `<div class="card" data-cat="${esc(s.category)}">${s.items.map(rowHTML).join('')}${addRow}</div>`;
+    return `<section class="cat ${collapsed ? 'collapsed' : ''} ${empty ? 'empty-cat' : ''}" data-cat="${esc(s.category)}">
       <button class="cat-head" data-cat="${esc(s.category)}">
-        ${badge(s.category)}<span class="cat-name">${esc(catName(s.category))}</span>${count}<span class="chev">▼</span>
+        ${badge(s.category)}<span class="cat-name">${esc(catName(s.category))}</span>${count}<span class="cat-add" role="button" aria-label="Add an item to ${esc(catName(s.category))}">+</span><span class="chev">▼</span>
       </button>${rows}</section>`;
   }).join('');
 
-  listEl.querySelectorAll('img.thumb[data-photo]').forEach(async img => {
+  // While you're typing a new item, keep that box (and the keyboard) where it is; redraw everything around it.
+  const liveRow = listEl.querySelector('.add-row');
+  if (liveRow && liveRow.contains(document.activeElement)) {
+    const temp = document.createElement('div');
+    temp.innerHTML = html;
+    const liveSec = liveRow.closest('section');
+    const newSec = [...temp.children].find(el => el.matches('section') && el.dataset.cat === liveSec.dataset.cat);
+    if (newSec) {
+      liveSec.className = newSec.className;
+      liveSec.querySelector('.cat-head').replaceWith(newSec.querySelector('.cat-head'));
+      const liveCard = liveRow.parentElement;
+      liveCard.querySelectorAll(':scope > .row').forEach(r => r.remove());
+      newSec.querySelectorAll('.card > .row').forEach(r => liveCard.insertBefore(r, liveRow));
+      [...listEl.children].forEach(el => { if (el !== liveSec) el.remove(); });
+      let before = true;
+      for (const el of [...temp.children]) {
+        if (el === newSec) { before = false; continue; }
+        if (before) listEl.insertBefore(el, liveSec); else listEl.append(el);
+      }
+      loadThumbs();
+      return;
+    }
+  }
+  listEl.innerHTML = html;
+  loadThumbs();
+}
+
+function loadThumbs() {
+  listEl.querySelectorAll('img.thumb[data-photo]:not([src])').forEach(async img => {
     const url = await getPhoto(img.dataset.photo);
     if (url) img.src = url;
   });
+}
+
+const SCAN_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V5a2 2 0 0 1 2-2h3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M7 8v8M10 8v8M13 8v8M17 8v8"/></svg>`;
+
+function addRowHTML(category) {
+  return `<div class="add-row" data-cat="${esc(category)}">
+      <span class="check ghost"></span>
+      <input class="add-input" placeholder="New item" autocomplete="off" autocorrect="on" enterkeyhint="next" dir="auto" aria-label="New item in ${esc(catName(category))}">
+      <button class="add-scan" aria-label="Scan a barcode into ${esc(catName(category))}">${SCAN_ICON}</button>
+    </div>
+    <div class="chips add-sugg"></div>`;
 }
 
 function rowHTML(i) {
@@ -1407,32 +1469,106 @@ function rowHTML(i) {
   </div>`;
 }
 
-// ---------- Drag to reorder with the ≡ handle ----------
+// ---------- Drag to reorder: the ≡ handle, or a long press on the item ----------
 
 let drag = null;
+let press = null; // a long press waiting to become a drag: { timer, x, y, row, pointerId }
+const LONG_PRESS_MS = 450;
 
 listEl.addEventListener('pointerdown', e => {
   const handle = e.target.closest('.handle');
-  if (!handle) return;
-  e.preventDefault();
-  const row = handle.closest('.row');
+  if (handle) {
+    e.preventDefault();
+    startDrag(handle.closest('.row'), e.pointerId, e.clientY, handle);
+    return;
+  }
+  // Long press anywhere on an item (not its ⋯ button or photo) picks it up.
+  const row = e.target.closest('.row');
+  if (!row || e.target.closest('.more, .thumb') || e.button > 0) return;
+  cancelPress();
+  press = { x: e.clientX, y: e.clientY, row, pointerId: e.pointerId };
+  press.timer = setTimeout(() => {
+    const p = press;
+    press = null;
+    if (!p || !p.row.isConnected) return;
+    if (navigator.vibrate) navigator.vibrate(25);
+    startDrag(p.row, p.pointerId, p.lastY ?? p.y, p.row);
+  }, LONG_PRESS_MS);
+});
+
+function cancelPress() {
+  if (press) clearTimeout(press.timer);
+  press = null;
+}
+
+// While dragging, stop the page from scrolling under your finger (iPhone needs this on touchmove).
+listEl.addEventListener('touchmove', e => { if (drag) e.preventDefault(); }, { passive: false });
+listEl.addEventListener('contextmenu', e => { if (drag || press) e.preventDefault(); });
+
+function startDrag(row, pointerId, clientY, captureEl) {
   const card = row.parentElement;
   const rows = [...card.querySelectorAll('.row')];
   const rects = rows.map(r => {
     const b = r.getBoundingClientRect();
     return { top: b.top + window.scrollY, height: b.height };
   });
+  // Every other category on screen, so you can drop the item into it.
+  const pageRect = el => { const b = el.getBoundingClientRect(); return { top: b.top + window.scrollY, bottom: b.bottom + window.scrollY, left: b.left, width: b.width }; };
+  const others = [...listEl.querySelectorAll('.card')].filter(c => c !== card).map(c => ({
+    cat: c.dataset.cat, el: c, rect: pageRect(c),
+    rows: [...c.querySelectorAll('.row')].map(r => ({ key: r.dataset.key, ...pageRect(r) }))
+  }));
+  const heads = [...listEl.querySelectorAll('.cat-head')].filter(h => h.dataset.cat !== card.dataset.cat)
+    .map(h => ({ cat: h.dataset.cat, el: h, rect: pageRect(h) }));
   drag = {
-    row, card, rows, rects,
+    row, card, rows, rects, others, heads,
+    home: pageRect(card),
     index: rows.indexOf(row),
     target: rows.indexOf(row),
-    startY: e.clientY + window.scrollY,
-    lastClientY: e.clientY
+    cross: null, // { cat, index, el } when hovering another category
+    startY: clientY + window.scrollY,
+    lastClientY: clientY
   };
   row.classList.add('dragging');
-  try { handle.setPointerCapture(e.pointerId); } catch {}
+  try { captureEl.setPointerCapture(pointerId); } catch {}
   drag.scrollTimer = setInterval(autoScroll, 16);
-});
+}
+
+let dropLine = null;
+function showDropLine(left, width, pageY) {
+  if (!dropLine) {
+    dropLine = document.createElement('div');
+    dropLine.className = 'drop-line';
+    document.body.append(dropLine);
+  }
+  Object.assign(dropLine.style, { left: `${left + 10}px`, width: `${width - 20}px`, top: `${pageY - 1.5}px` });
+}
+function clearCross() {
+  if (drag?.cross) drag.cross.el.classList.remove('drop-target');
+  if (drag) drag.cross = null;
+  dropLine?.remove();
+  dropLine = null;
+}
+
+/** Is the finger over another category? Then that's where the item goes. */
+function crossTarget(pageY) {
+  const { home, others, heads } = drag;
+  if (pageY >= home.top - 12 && pageY <= home.bottom + 12) return null;
+  for (const o of others) {
+    if (pageY < o.rect.top - 12 || pageY > o.rect.bottom + 12) continue;
+    let index = 0;
+    o.rows.forEach(r => { if ((r.top + r.bottom) / 2 < pageY) index++; });
+    const lineY = index === 0 ? o.rect.top : index >= o.rows.length ? o.rect.bottom : o.rows[index].top;
+    return { cat: o.cat, index, el: o.el, line: [o.rect.left, o.rect.width, lineY] };
+  }
+  for (const h of heads) {
+    if (pageY >= h.rect.top - 4 && pageY <= h.rect.bottom + 4) {
+      const o = others.find(x => x.cat === h.cat);
+      return { cat: h.cat, index: o ? o.rows.length : 0, el: h.el, line: null };
+    }
+  }
+  return null;
+}
 
 function moveDrag(clientY) {
   if (!drag) return;
@@ -1440,6 +1576,18 @@ function moveDrag(clientY) {
   const { rows, rects, index } = drag;
   const dy = clientY + window.scrollY - drag.startY;
   drag.row.style.transform = `translateY(${dy}px)`;
+
+  const cross = crossTarget(clientY + window.scrollY);
+  if (cross) {
+    // Over another category: close the gap at home and mark where it will land.
+    if (!drag.cross || drag.cross.el !== cross.el) { clearCross(); cross.el.classList.add('drop-target'); }
+    drag.cross = cross;
+    if (cross.line) showDropLine(...cross.line); else { dropLine?.remove(); dropLine = null; }
+    rows.forEach((r, i) => { if (i !== index) r.style.transform = ''; });
+    drag.target = index;
+    return;
+  }
+  if (drag.cross) clearCross();
   const center = rects[index].top + rects[index].height / 2 + dy;
   let target = 0;
   rects.forEach((r, i) => { if (i !== index && r.top + r.height / 2 < center) target++; });
@@ -1468,6 +1616,11 @@ function autoScroll() {
 }
 
 listEl.addEventListener('pointermove', e => {
+  if (press && e.pointerId === press.pointerId) {
+    // Moved before the long press finished: it's a scroll or a swipe, not a pick-up.
+    if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) cancelPress();
+    else press.lastY = e.clientY;
+  }
   if (!drag) return;
   e.preventDefault();
   moveDrag(e.clientY);
@@ -1476,9 +1629,26 @@ listEl.addEventListener('pointermove', e => {
 function endDrag() {
   if (!drag) return;
   clearInterval(drag.scrollTimer);
-  const { rows, index, target, card } = drag;
+  const { rows, index, target, card, cross } = drag;
+  clearCross();
   rows.forEach(r => { r.style.transform = ''; });
   drag.row.classList.remove('dragging');
+  if (cross) {
+    // Dropped on another category: move it there, at the spot where it was let go.
+    const item = state.items.find(i => i.id === drag.row.dataset.id);
+    const other = drag.others.find(o => o.cat === cross.cat);
+    const keys = (other ? other.rows.map(r => r.key) : []).filter(k => k !== drag.row.dataset.key);
+    keys.splice(Math.min(cross.index, keys.length), 0, drag.row.dataset.key);
+    drag = null;
+    justDragged = true;
+    setTimeout(() => { justDragged = false; }, 50);
+    if (item) {
+      saveItemOrder(cross.cat, keys);
+      moveItem(item, cross.cat);
+      if (navigator.vibrate) navigator.vibrate(15);
+    }
+    return;
+  }
   const ordered = rows.filter((_, i) => i !== index);
   ordered.splice(target, 0, rows[index]);
   drag = null;
@@ -1490,12 +1660,16 @@ function endDrag() {
   }
 }
 let justDragged = false;
-listEl.addEventListener('pointerup', endDrag);
-listEl.addEventListener('pointercancel', endDrag);
+listEl.addEventListener('pointerup', () => { cancelPress(); endDrag(); });
+listEl.addEventListener('pointercancel', () => { cancelPress(); endDrag(); });
 
 listEl.addEventListener('click', e => {
   if (e.target.closest('.handle') || justDragged) return; // the handle is only for dragging
+  if (e.target.closest('.add-row, .add-sugg')) return;
+  const plus = e.target.closest('.cat-add');
+  if (plus) return startAdding(plus.closest('.cat-head').dataset.cat);
   const head = e.target.closest('.cat-head');
+  if (head && head.closest('.empty-cat')) return startAdding(head.dataset.cat);
   if (head) {
     const cat = head.dataset.cat;
     state.collapsed.has(cat) ? state.collapsed.delete(cat) : state.collapsed.add(cat);
@@ -1516,31 +1690,52 @@ listEl.addEventListener('click', e => {
 });
 
 // ---------------------------------------------------------------------------
-// Rendering: add bar
+// Adding items: tap + on a category, type in the new row that opens there
 // ---------------------------------------------------------------------------
 
-const input = $('#newName');
-const addBtn = $('#addBtn');
+const addInput = () => listEl.querySelector('.add-input');
 
-function renderChips() {
-  const cats = categories();
-  if (!cats.includes(state.newCategory)) state.newCategory = FALLBACK;
-  $('#catChips').innerHTML = cats.map(c => {
-    const on = c === state.newCategory;
-    const color = catColor(c);
-    const style = on
-      ? `background:${color};color:#fff`
-      : `background:color-mix(in srgb, ${color} 14%, transparent);color:${color}`;
-    return `<button class="chip" data-cat="${esc(c)}" style="${style}">${emoji(catIconName(c))} ${esc(catName(c))}</button>`;
-  }).join('');
+/** The + on a category (or tapping an empty category): open a new row in it, keyboard up. */
+function startAdding(category) {
+  if (state.adding && state.adding !== category) commitAdd();
+  state.adding = category;
+  state.newCategory = category;
+  state.collapsed.delete(category);
+  saveCollapsed();
+  renderList();
+  const inp = addInput();
+  if (inp) {
+    inp.focus();
+    inp.closest('.add-row').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+  renderAddSuggestions();
+  renderBottom();
 }
 
-function renderSuggestions() {
-  const typed = !!trim(input.value);
-  const list = typed ? suggestions(input.value) : (state.focused ? favoritesToAdd() : []);
-  const box = $('#suggest');
-  if (!list.length) { box.innerHTML = ''; return; }
-  box.innerHTML = (typed ? '' : `<span class="chip-label">★</span>`) + list.map(k =>
+/** Add what's typed (if anything) to the open category. */
+function commitAdd(text) {
+  const inp = addInput();
+  const name = trim(text ?? inp?.value ?? '');
+  if (inp) inp.value = '';
+  if (name && state.adding) addItem(name, state.adding);
+  renderAddSuggestions();
+}
+
+function stopAdding() {
+  if (!state.adding) return;
+  commitAdd();
+  state.adding = null;
+  renderList();
+  renderBottom();
+}
+
+function renderAddSuggestions() {
+  const box = listEl.querySelector('.add-sugg');
+  const inp = addInput();
+  if (!box || !inp) return;
+  const typed = !!trim(inp.value);
+  const list = typed ? suggestions(inp.value) : favoritesToAdd();
+  box.innerHTML = list.map(k =>
     `<button class="chip sugg" data-known="${esc(k.id)}" style="border-color:color-mix(in srgb, ${catColor(k.category)} 40%, transparent)">
       ${emoji(catIconName(k.category))} ${esc(k.name)}${k.isFavorite ? ' <span class="star">★</span>' : ''}
     </button>`).join('');
@@ -1553,11 +1748,9 @@ function renderBottom() {
   if (a) $('#toastMsg').textContent = actionMessage(a);
 
   const checked = state.items.filter(i => i.isChecked).length;
-  const showClear = checked > 0 && !a && !trim(input.value) && !state.focused;
+  const showClear = checked > 0 && !a && !state.adding;
   $('#clearWrap').hidden = !showClear;
   $('#clearBtn').textContent = `✓ Clear ${checked} bought`;
-
-  addBtn.disabled = !trim(input.value);
   requestAnimationFrame(updateBottomHeight);
 }
 
@@ -1565,42 +1758,50 @@ function updateBottomHeight() {
   document.documentElement.style.setProperty('--bottom-h', `${$('#bottom').offsetHeight}px`);
 }
 
-function addQuick() {
-  if (!trim(input.value)) return;
-  addItem(input.value, state.newCategory);
-  input.value = '';
-  renderSuggestions();
-  renderBottom();
-  input.focus();
-}
-
-// Keep the keyboard open when tapping chips.
-for (const id of ['#catChips', '#suggest', '#addBtn']) {
-  $(id).addEventListener('pointerdown', e => { if (state.focused) e.preventDefault(); });
-}
-
-$('#catChips').addEventListener('click', e => {
-  const chip = e.target.closest('.chip');
-  if (!chip) return;
-  state.newCategory = chip.dataset.cat;
-  renderChips();
+// Typing in the new row
+listEl.addEventListener('input', e => { if (e.target.matches('.add-input')) renderAddSuggestions(); });
+listEl.addEventListener('keydown', e => {
+  if (!e.target.matches('.add-input') || e.key !== 'Enter') return;
+  e.preventDefault();
+  commitAdd(); // stays open for the next item
 });
-
-$('#suggest').addEventListener('click', e => {
-  const chip = e.target.closest('[data-known]');
-  if (!chip) return;
-  const k = state.known[chip.dataset.known];
-  if (!k) return;
-  addItem(k.name, k.category);
-  input.value = '';
-  renderSuggestions();
-  renderBottom();
+listEl.addEventListener('focusout', e => {
+  if (!e.target.matches('.add-input')) return;
+  setTimeout(() => {
+    // Still inside the new row (e.g. tapped a suggestion)? Keep going.
+    if (listEl.querySelector('.add-row')?.contains(document.activeElement)) return;
+    if (state.scanningFor) return;
+    stopAdding();
+  }, 150);
 });
+// Tapping a suggestion or the scan button shouldn't close the keyboard first.
+listEl.addEventListener('pointerdown', e => {
+  if (e.target.closest('.add-sugg [data-known], .add-scan')) e.preventDefault();
+});
+listEl.addEventListener('click', e => {
+  const chip = e.target.closest('.add-sugg [data-known]');
+  if (chip) {
+    const k = state.known[chip.dataset.known];
+    if (k && state.adding) commitAdd(k.name);
+    addInput()?.focus();
+    return;
+  }
+  if (e.target.closest('.add-scan')) {
+    const cat = state.adding;
+    commitAdd();
+    state.scanningFor = cat;
+    state.adding = null;
+    renderList();
+    renderBottom();
+    state.scanningFor = null;
+    scanToAdd(cat);
+  }
+}, true);
 
 // Long-press a suggestion to forget it (e.g. a typo).
 let pressTimer = null;
-$('#suggest').addEventListener('touchstart', e => {
-  const chip = e.target.closest('[data-known]');
+listEl.addEventListener('touchstart', e => {
+  const chip = e.target.closest('.add-sugg [data-known]');
   if (!chip) return;
   pressTimer = setTimeout(() => {
     const k = state.known[chip.dataset.known];
@@ -1608,33 +1809,11 @@ $('#suggest').addEventListener('touchstart', e => {
   }, 600);
 }, { passive: true });
 for (const ev of ['touchend', 'touchmove', 'touchcancel']) {
-  $('#suggest').addEventListener(ev, () => clearTimeout(pressTimer), { passive: true });
+  listEl.addEventListener(ev, () => clearTimeout(pressTimer), { passive: true });
 }
 
-input.addEventListener('input', () => {
-  const cat = knownCategory(input.value);
-  if (cat && cat !== state.newCategory) { state.newCategory = cat; renderChips(); }
-  renderSuggestions();
-  renderBottom();
-});
-input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addQuick(); } });
-input.addEventListener('focus', () => { state.focused = true; renderSuggestions(); renderBottom(); });
-input.addEventListener('blur', () => {
-  setTimeout(() => { state.focused = false; renderSuggestions(); renderBottom(); }, 150);
-});
-addBtn.addEventListener('click', addQuick);
 $('#undoBtn').addEventListener('click', undo);
 $('#clearBtn').addEventListener('click', clearChecked);
-$('#scanBtn').addEventListener('click', () => {
-  input.blur();
-  scanToAdd();
-});
-$('#detailsBtn').addEventListener('click', () => {
-  const name = input.value;
-  input.value = '';
-  renderBottom();
-  openEditor(null, name, state.newCategory);
-});
 
 $('#catsBtn').addEventListener('click', openCategories);
 $('#histBtn').addEventListener('click', openHistory);
@@ -1692,18 +1871,14 @@ function openItemActions(item) {
     left: { label: 'Cancel' },
     render(body, sheet) {
       body.innerHTML = `<div class="form">
-        <button class="action" data-a="compare"><span class="ico">💰</span>Compare prices</button>
-        <button class="action" data-a="move"><span class="ico">➡️</span>Move to…</button>
+        <button class="action" data-a="edit"><span class="ico">✏️</span>Edit</button>
         <button class="action" data-a="fav"><span class="ico">${fav ? '☆' : '⭐'}</span>${fav ? 'Remove from favorites' : 'Add to favorites'}</button>
-        <button class="action" data-a="edit"><span class="ico">✏️</span>Edit (quantity, note, photo)</button>
         <button class="action danger" data-a="delete"><span class="ico">🗑️</span>Delete</button>
       </div>`;
       body.onclick = e => {
         const a = e.target.closest('[data-a]')?.dataset.a;
         if (!a) return;
         sheet.close();
-        if (a === 'compare') openCompare(item);
-        if (a === 'move') openMoveTo(item);
         if (a === 'fav') toggleFavorite(item);
         if (a === 'edit') openEditor(item);
         if (a === 'delete') deleteItem(item);
@@ -1810,7 +1985,7 @@ function openEditor(existing, defaultName = '', defaultCategory = FALLBACK, extr
           <button class="action" id="edScan"><span class="ico">📷</span>${draft.barcode ? 'Scan again' : 'Scan barcode'}</button>
           ${draft.barcode ? `<button class="action danger" id="edNoCode"><span class="ico">🗑️</span>Remove barcode</button>` : ''}
         </div>
-        <div class="footnote">With a barcode, "Compare prices" finds the exact product.</div>`;
+        <div class="footnote">With a barcode, scanning this product next time recognizes it right away.</div>`;
 
       const name = $('#edName', body);
       name.oninput = () => { draft.name = name.value; s.setRightEnabled(!!trim(name.value)); };
@@ -1869,7 +2044,6 @@ function openMenu() {
       body.innerHTML = `<div class="form">
         <button class="action" data-a="household"><span class="ico">🏠</span>Household & invite</button>
         <button class="action" data-a="share"><span class="ico">📤</span>Share list as text</button>
-        <button class="action" data-a="cats"><span class="ico">🎨</span>Categories, colors & order</button>
       </div>`;
       body.onclick = e => {
         const a = e.target.closest('[data-a]')?.dataset.a;
@@ -1885,27 +2059,105 @@ function openMenu() {
 
 // ---------- Categories ----------
 
+function setCategoryOrder(order) {
+  state.order = order;
+  setDoc(listRef, { categoryOrder: order }, { merge: true });
+  renderAll();
+}
+
+/** Drag rows inside `box` to reorder them: by the ≡ handle, or a long press on the row.
+ *  onDrop(keys) gets the rows' data-key values in their new order. */
+function makeSortable(box, onDrop) {
+  let s = null, press = null;
+  const scroller = box.closest('.sheet-body') || document.scrollingElement;
+  const begin = (row, pointerId, clientY, captureEl) => {
+    const rows = [...box.querySelectorAll('[data-key]')];
+    const rects = rows.map(r => r.getBoundingClientRect()).map(b => ({ mid: b.top + b.height / 2, h: b.height }));
+    s = { row, rows, rects, index: rows.indexOf(row), target: rows.indexOf(row), startY: clientY, startScroll: scroller.scrollTop };
+    row.classList.add('dragging');
+    box.classList.add('sorting');
+    try { captureEl.setPointerCapture(pointerId); } catch {}
+  };
+  const move = clientY => {
+    const { rows, rects, index } = s;
+    const scrolled = scroller.scrollTop - s.startScroll;
+    const dy = clientY - s.startY + scrolled;
+    s.row.style.transform = `translateY(${dy}px)`;
+    const center = rects[index].mid + dy - scrolled;
+    let target = 0;
+    rects.forEach((r, i) => { if (i !== index && r.mid - scrolled < center) target++; });
+    s.target = target;
+    rows.forEach((r, i) => {
+      if (i === index) return;
+      const shift = i > index && i <= target ? -rects[index].h : i < index && i >= target ? rects[index].h : 0;
+      r.style.transform = shift ? `translateY(${shift}px)` : '';
+    });
+  };
+  const end = () => {
+    if (press) { clearTimeout(press.timer); press = null; }
+    if (!s) return;
+    const { rows, index, target } = s;
+    rows.forEach(r => { r.style.transform = ''; });
+    s.row.classList.remove('dragging');
+    box.classList.remove('sorting');
+    s = null;
+    box.dataset.justDragged = '1';
+    setTimeout(() => { delete box.dataset.justDragged; }, 50);
+    if (target === index) return;
+    const ordered = rows.filter((_, i) => i !== index);
+    ordered.splice(target, 0, rows[index]);
+    onDrop(ordered.map(r => r.dataset.key));
+  };
+  box.addEventListener('pointerdown', e => {
+    const row = e.target.closest('[data-key]');
+    if (!row) return;
+    const handle = e.target.closest('.handle');
+    if (handle) { e.preventDefault(); begin(row, e.pointerId, e.clientY, handle); return; }
+    if (e.target.closest('input, button') || e.button > 0) return; // typing a name or tapping the icon
+    press = { x: e.clientX, y: e.clientY, lastY: e.clientY, row, pointerId: e.pointerId };
+    press.timer = setTimeout(() => {
+      const p = press; press = null;
+      if (navigator.vibrate) navigator.vibrate(25);
+      begin(p.row, p.pointerId, p.lastY, p.row);
+    }, LONG_PRESS_MS);
+  });
+  box.addEventListener('pointermove', e => {
+    if (press) {
+      if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) { clearTimeout(press.timer); press = null; }
+      else press.lastY = e.clientY;
+    }
+    if (!s) return;
+    e.preventDefault();
+    move(e.clientY);
+  });
+  box.addEventListener('touchmove', e => { if (s) e.preventDefault(); }, { passive: false });
+  box.addEventListener('contextmenu', e => { if (s || press) e.preventDefault(); });
+  box.addEventListener('pointerup', end);
+  box.addEventListener('pointercancel', end);
+  return () => !!s;
+}
+
 function openCategories() {
   const sheet = openSheet({
     title: 'Categories',
     full: true,
     right: { label: 'Done', action: s => s.close() },
     render(body, s) {
-      // Don't redraw while you're typing a new name (it would lose what you typed).
+      // Don't redraw while you're typing a new name or dragging a category.
       if (body.contains(document.activeElement) && document.activeElement.matches('.cat-name-input')) return;
+      if (s.isSorting?.()) return;
       const cats = categories();
       body.innerHTML = `
         <div class="group-title">Shopping order</div>
-        <div class="form">${cats.map((c, i) => `
-          <div class="cat-row">
+        <div class="form" id="catSort">${cats.map(c => `
+          <div class="cat-row" data-key="${esc(c)}">
             <button class="badge-btn" data-style="${esc(c)}" aria-label="Color and icon">${badge(c)}</button>
             <input class="cat-name-input" data-rename="${esc(c)}" value="${esc(catName(c))}" placeholder="${esc(c)}" enterkeyhint="done" dir="auto" aria-label="Category name">
-            <button class="mini" data-up="${i}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">▲</button>
-            <button class="mini" data-down="${i}" ${i === cats.length - 1 ? 'disabled' : ''} aria-label="Move down">▼</button>
             ${DEFAULTS.includes(c) ? '' : `<button class="mini del" data-del="${esc(c)}" aria-label="Delete">✕</button>`}
+            <span class="handle" aria-label="Drag to reorder">≡</span>
           </div>`).join('')}
         </div>
-        <div class="footnote">Tap a name to rename it (e.g. in Hebrew). Tap the icon to change its color and icon. Use ▲▼ to put categories in the order you shop. To go back to the original name, clear it.</div>
+        <div class="footnote">Drag ≡ (or hold a category) to put them in the order you shop. Tap a name to rename it (e.g. in Hebrew); clear it to go back to the original. Tap the icon to change its color and icon.</div>
         <div class="group-title">Add a category</div>
         <div class="form add-cat">
           <input id="newCat" placeholder="New category" enterkeyhint="done">
@@ -1926,13 +2178,13 @@ function openCategories() {
         inp.onchange = save;
         inp.onkeydown = e => { if (e.key === 'Enter') inp.blur(); };
       });
+      s.isSorting = makeSortable($('#catSort', body), keys => { setCategoryOrder(keys); s.refresh(); });
       $('#addCat', body).onclick = add;
       $('#newCat', body).onkeydown = e => { if (e.key === 'Enter') add(); };
       body.onclick = e => {
         const t = e.target.closest('button');
         if (!t) return;
-        if (t.dataset.up) { moveCategory(+t.dataset.up, -1); s.refresh(); }
-        if (t.dataset.down) { moveCategory(+t.dataset.down, 1); s.refresh(); }
+        if ($('#catSort', body).dataset.justDragged) return;
         if (t.dataset.del && confirm(`Delete "${catName(t.dataset.del)}"? Its items stay on the list.`)) removeCategory(t.dataset.del);
         if (t.dataset.style) openStyleEditor(t.dataset.style);
       };
@@ -2067,7 +2319,9 @@ function openHistory() {
                   : h.action === 'moved'
                     ? `${verb} <strong>${esc(h.name)}</strong> to ${esc(catName(h.category))}`
                     : `${verb} <strong>${esc(h.name)}</strong>`;
-                const sub = h.action === 'undo' ? timeOf(h.date) : `${esc(catName(h.category))} · ${timeOf(h.date)}`;
+                const who = whoDid(h);
+                const sub = [h.action === 'undo' ? '' : esc(catName(h.category)), who ? `<span class="who">${esc(who)}</span>` : '', timeOf(h.date)]
+                  .filter(Boolean).join(' · ');
                 const canRestore = (h.action === 'deleted' || h.action === 'cleared') && !isOnList(h.name);
                 return `<div class="hist-row">
                   <span class="dot" style="background:${color}">${icon}</span>
@@ -2165,7 +2419,7 @@ function friendlyAuthError(err) {
 function showAuthScreen(mode = 'signin') {
   const signup = mode === 'signup';
   showGate(`
-    <img class="gate-icon" src="apple-touch-icon.png?v=2" alt="">
+    <img class="gate-icon" src="apple-touch-icon.png?v=3" alt="">
     <h2>Groceries</h2>
     <p class="gate-sub">A shared grocery list for your home.</p>
     <div class="tabs">
@@ -2465,7 +2719,6 @@ function openHouseholdSettings() {
 // Start
 // ---------------------------------------------------------------------------
 
-renderChips();
 renderBottom();
 new ResizeObserver(updateBottomHeight).observe($('#bottom'));
 
