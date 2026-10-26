@@ -367,12 +367,45 @@ def previous_column(prev, label):
 
 
 # ---------------------------------------------------------------------------
+# Prices sent from the Mac (for chains that block computers outside Israel)
+# ---------------------------------------------------------------------------
+
+MAC_FILE = os.path.join(ROOT, "extra", "mac-prices.json")
+
+
+def load_mac_prices():
+    if not os.path.exists(MAC_FILE):
+        log("No prices from the Mac yet (extra/mac-prices.json is missing).")
+        return None
+    try:
+        data = json.load(open(MAC_FILE, encoding="utf-8"))
+        log(f"Prices from the Mac: {data.get('updated')} – stores: {[s.get('label') for s in data.get('stores', [])]}")
+        return data
+    except Exception as err:  # noqa: BLE001
+        log(f"Could not read the Mac's prices: {err}")
+        return None
+
+
+def is_recent(stamp, days=2):
+    """Whether a YYYYMMDD… date is from today or the last "days" days (Israel time)."""
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Asia/Jerusalem")).date()
+        day = datetime.strptime(str(stamp)[:8], "%Y%m%d").date()
+        return (today - day).days < days
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 async def main():
-    config = json.load(open(os.path.join(HERE, "stores.json"), encoding="utf-8"))
+    stores_file = os.environ.get("STORES_FILE") or os.path.join(HERE, "stores.json")
+    config = json.load(open(stores_file, encoding="utf-8"))
     prev = load_previous()
+    mac = load_mac_prices() if any(t.get("source") == "mac" for t in config["stores"]) else None
     os.makedirs(SITE, exist_ok=True)
 
     store_lists = {}
@@ -385,6 +418,33 @@ async def main():
         entry = {"label": label, "place": target["place"], "scraper": scraper, "ok": False}
         started = time.time()
         details.clear()
+
+        if target.get("source") == "mac":
+            # This chain blocks computers outside Israel: its prices come from the Mac.
+            store, items = previous_column(mac, label)
+            if not items:
+                store, items = previous_column(prev, label)
+                stale = True
+                how = "kept from the last run (no prices from the Mac)"
+            else:
+                stale = not is_recent(store.get("date"))
+                how = "from your Mac" + (" (not updated recently – is the Mac on?)" if stale else "")
+            if items:
+                columns.append({
+                    "label": label, "place": target["place"], "branch": store.get("branch", ""),
+                    "date": store.get("date", ""), "stale": stale, "_items": items
+                })
+                entry.update(ok=not stale, items=len(items), how_chosen=how, file_date=store.get("date", ""),
+                             branch={"id": "", "name": store.get("branch", ""), "address": ""})
+                if stale:
+                    entry["kept_previous"] = store.get("date", "")
+                log(f"   {len(items)} products {how}, dated {store.get('date')}")
+            else:
+                entry["error"] = "no prices from the Mac yet – run the setup on the Mac"
+                log(f"   FAILED: {entry['error']}")
+            entry["seconds"] = round(time.time() - started)
+            report.append(entry)
+            continue
         try:
             if scraper not in store_lists:
                 folder = os.path.join(DUMPS, scraper, "stores")

@@ -1,0 +1,35 @@
+{
+  "_help": "Stores your Mac downloads every morning (they block computers outside Israel).",
+  "city": [
+    "הרצליה",
+    "הרצלייה",
+    "הרצליה פיתוח",
+    "herzliya",
+    "herzliyya",
+    "6400"
+  ],
+  "stores": [
+    {
+      "label": "Victory",
+      "place": "7 Stars Mall",
+      "scraper": "VICTORY_NEW_SOURCE",
+      "keywords": [
+        "שבעת הכוכבים",
+        "7 כוכבים",
+        "כוכבים"
+      ],
+      "store_id": 74
+    },
+    {
+      "label": "Super-Pharm",
+      "place": "7 Stars Mall",
+      "scraper": "SUPER_PHARM",
+      "keywords": [
+        "שבעת הכוכבים",
+        "7 כוכבים",
+        "כוכבים"
+      ],
+      "store_id": null
+    }
+  ]
+}
