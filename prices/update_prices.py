@@ -386,7 +386,8 @@ def _number(text):
 _DEAL_N_FOR = re.compile(r"(\d+)\s*ב\s*-?\s*(\d+(?:\.\d+)?)")
 _DEAL_PLUS = re.compile(r"(?<![\d.])(\d)\s*\+\s*(\d)(?![\d.])")
 _DEAL_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
-_IS_DEAL = re.compile(r"^(\d+(?:\.\d+)? for ₪|\d\+\d$|[\d.]+% off|₪)")
+_DEAL_2ND = re.compile(r"שני\s*ב\s*-?\s*(\d+(?:\.\d+)?)(?![\d.])(?!\s*%)")
+_IS_DEAL = re.compile(r"^(\d+(?:\.\d+)? for ₪|\d\+\d$|[\d.]+% off|₪|2nd for ₪)")
 
 
 def promo_text(fields):
@@ -399,11 +400,19 @@ def promo_text(fields):
     m = _DEAL_PLUS.search(desc)
     if m:
         return f"{m.group(1)}+{m.group(2)}"
+    m = _DEAL_2ND.search(desc)
+    if m:
+        return f"2nd for ₪{m.group(1)}"
     m = _DEAL_PCT.search(desc)
     if m:
         return f"{m.group(1)}% off" + (" the 2nd" if "שני" in desc else "")
     qty = _number(fields.get("minqty"))
     price = _number(fields.get("discountedprice"))
+    # A single sale price ("14.90לילי תחבושות", "… 13.90 ₪"): shorten it only if the sale-price field agrees.
+    if price and price > 0 and (not qty or qty <= 1):
+        numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", desc)]
+        if any(abs(n - price) < 0.011 for n in numbers):
+            return f"₪{price:.2f}"
     built = ""
     if price and price > 0:
         shown = f"{price:g}" if price == int(price) else f"{price:.2f}"
@@ -442,6 +451,12 @@ def read_promos(folder, chain_id="", store_codes=None):
             continue
         seen += 1
         fields = {local(c.tag): (c.text or "").strip() for c in kids if len(c) == 0}
+        # Some chains put the deal numbers one level down, in <Groups><Group>.
+        for c in el.iter():
+            key = local(c.tag)
+            if key in ("minqty", "discountedprice", "discountrate") and len(c) == 0 and (c.text or "").strip() \
+                    and not fields.get(key):
+                fields[key] = c.text.strip()
         start = _promo_date(fields.get("promotionstartdate") or fields.get("promotionstartdatetime"))
         end = _promo_date(fields.get("promotionenddate") or fields.get("promotionenddatetime"))
         if (start and start > today) or (end and end < today):
@@ -450,8 +465,8 @@ def read_promos(folder, chain_id="", store_codes=None):
         # Club numbers are written as "0", or "0=אין" / "2=לייף סטייל" (0 = everyone).
         clubs = [re.sub(r"\D.*", "", (c.text or "").strip()) for c in el.iter() if local(c.tag) == "clubid"]
         club_only = any(c not in ("", "0") for c in clubs) and "0" not in clubs
-        if fields.get("additionaliscoupon") == "1":
-            club_only = True
+        if fields.get("additionaliscoupon") == "1" or "קופון" in fields.get("promotiondescription", ""):
+            club_only = True  # needs a club card or a coupon
         label = promo_text(fields)
         if not label:
             continue
