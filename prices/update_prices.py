@@ -383,9 +383,25 @@ def _number(text):
         return None
 
 
+_DEAL_N_FOR = re.compile(r"(\d+)\s*ב\s*-?\s*(\d+(?:\.\d+)?)")
+_DEAL_PLUS = re.compile(r"(?<![\d.])(\d)\s*\+\s*(\d)(?![\d.])")
+_DEAL_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_IS_DEAL = re.compile(r"^(\d+(?:\.\d+)? for ₪|\d\+\d$|[\d.]+% off|₪)")
+
+
 def promo_text(fields):
-    """A short description, e.g. '2 ב-50' as the chain wrote it, or built from the numbers."""
+    """A short deal, e.g. '2 for ₪50', '1+1', '20% off' – or the chain's own words if it's something else."""
     desc = re.sub(r"\s+", " ", fields.get("promotiondescription", "")).strip()
+    # Chains often repeat the product name in the description; keep just the deal when we can see it.
+    m = _DEAL_N_FOR.search(desc)
+    if m and int(m.group(1)) > 1:
+        return f"{m.group(1)} for ₪{m.group(2)}"
+    m = _DEAL_PLUS.search(desc)
+    if m:
+        return f"{m.group(1)}+{m.group(2)}"
+    m = _DEAL_PCT.search(desc)
+    if m:
+        return f"{m.group(1)}% off" + (" the 2nd" if "שני" in desc else "")
     qty = _number(fields.get("minqty"))
     price = _number(fields.get("discountedprice"))
     built = ""
@@ -419,19 +435,20 @@ def read_promos(folder, chain_id="", store_codes=None):
 
     today = _israel_today()
     promos = {}
-    seen = skipped_dates = 0
+    seen = skipped_dates = skipped_broad = 0
     for el in root.iter():
         kids = [c for c in el if isinstance(c.tag, str)]
         if not any(local(c.tag) == "promotiondescription" for c in kids):
             continue
         seen += 1
         fields = {local(c.tag): (c.text or "").strip() for c in kids if len(c) == 0}
-        start = _promo_date(fields.get("promotionstartdate"))
-        end = _promo_date(fields.get("promotionenddate"))
+        start = _promo_date(fields.get("promotionstartdate") or fields.get("promotionstartdatetime"))
+        end = _promo_date(fields.get("promotionenddate") or fields.get("promotionenddatetime"))
         if (start and start > today) or (end and end < today):
             skipped_dates += 1
             continue
-        clubs = [(c.text or "").strip() for c in el.iter() if local(c.tag) == "clubid"]
+        # Club numbers are written as "0", or "0=אין" / "2=לייף סטייל" (0 = everyone).
+        clubs = [re.sub(r"\D.*", "", (c.text or "").strip()) for c in el.iter() if local(c.tag) == "clubid"]
         club_only = any(c not in ("", "0") for c in clubs) and "0" not in clubs
         if fields.get("additionaliscoupon") == "1":
             club_only = True
@@ -444,6 +461,10 @@ def read_promos(folder, chain_id="", store_codes=None):
             sub = {local(c.tag): (c.text or "").strip() for c in item if isinstance(c.tag, str) and len(c) == 0}
             if "itemcode" in sub and sub.get("isgiftitem", "0") != "1":
                 codes.append(re.sub(r"\D", "", sub["itemcode"]))
+        # Store-wide offers in free text ("buy any beauty product, add ₪9.90 and get a gift…") are noise on a product.
+        if len(codes) > 50 and not _IS_DEAL.match(label):
+            skipped_broad += 1
+            continue
         entry = (label, end.isoformat() if end else "", club_only)
         for code in codes:
             if len(code) < 8 or (store_codes is not None and code not in store_codes):
@@ -455,7 +476,8 @@ def read_promos(folder, chain_id="", store_codes=None):
     for code, lst in promos.items():
         lst.sort(key=lambda e: (e[2], e[1] or "9999"))
         del lst[2:]
-    log(f"   {seen} sale records, {skipped_dates} not running today, {len(promos)} products on sale")
+    log(f"   {seen} sale records, {skipped_dates} not running today, {skipped_broad} store-wide offers skipped, "
+        f"{len(promos)} products on sale")
     if seen == 0:
         log(f"   sales file starts with: {text[:500]!r}")
     return promos
