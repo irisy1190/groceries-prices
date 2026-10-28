@@ -338,7 +338,9 @@ def read_prices(folder, chain_id=""):
         # ManufacturerName (the brand, e.g. "הר ברכה") is kept apart: store names often leave the brand out,
         # and the app's search looks in both.
         name = rec.get("itemname", "") or rec.get("manufactureritemdescription", "")
-        items[code] = (name, price, clean_maker(rec.get("manufacturername", "")))
+        # The tag is spelled ManufacturerName or ManufactureName depending on the chain.
+        maker = clean_maker(rec.get("manufacturername", "") or rec.get("manufacturename", ""))
+        items[code] = (name, price, maker)
     diagnose(latest, recs, items, dropped)
     return latest, items
 
