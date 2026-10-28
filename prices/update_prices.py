@@ -297,6 +297,17 @@ def to_price(text):
         return None
 
 
+_NO_MAKER = {"לא ידוע", "לא ידועה", "כללי", "ללא", "אין", "unknown", "none", "null", "general", "-", "--", "0", "*"}
+
+
+def clean_maker(text):
+    """The manufacturer's name, or "" when the file only has a placeholder."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip(" .,-_*\"'")
+    if len(text) < 2 or len(text) > 40 or text.lower() in _NO_MAKER or re.fullmatch(r"[\d\s.]+", text):
+        return ""
+    return text
+
+
 def read_prices(folder, chain_id=""):
     files = xml_files(folder)
     full = [f for f in files if "pricefull" in os.path.basename(f).lower()] or files
@@ -324,9 +335,10 @@ def read_prices(folder, chain_id=""):
         if price is None:
             dropped["no price"] += 1
             continue
-        # (ManufacturerName is often the importer or the store itself, so it's not added to the name.)
+        # ManufacturerName (the brand, e.g. "הר ברכה") is kept apart: store names often leave the brand out,
+        # and the app's search looks in both.
         name = rec.get("itemname", "") or rec.get("manufactureritemdescription", "")
-        items[code] = (name, price)
+        items[code] = (name, price, clean_maker(rec.get("manufacturername", "")))
     diagnose(latest, recs, items, dropped)
     return latest, items
 
@@ -523,10 +535,12 @@ def previous_column(prev, label):
     for idx, store in enumerate(prev.get("stores", [])):
         if store.get("label") == label:
             column = {}
+            makers = prev.get("makers", [])
             for code, row in prev.get("items", {}).items():
                 prices = row[1] if len(row) > 1 else []
+                maker = makers[row[2]] if len(row) > 2 and isinstance(row[2], int) and row[2] < len(makers) else ""
                 if idx < len(prices) and prices[idx] is not None:
-                    column[code] = (row[0], prices[idx])
+                    column[code] = (row[0], prices[idx], maker)
             return store, column
     return None, {}
 
@@ -633,6 +647,7 @@ async def main():
             entry["seconds"] = round(time.time() - started)
             report.append(entry)
             continue
+
         try:
             if scraper not in store_lists:
                 folder = os.path.join(DUMPS, scraper, "stores")
@@ -705,14 +720,24 @@ async def main():
             entry["details"] = details[-10:]
         report.append(entry)
 
-    # Combine: { barcode: [name, [price per store]] }
-    combined = {}
+    # Combine: { barcode: [name, [price per store], maker index?] } – makers listed once in "makers".
+    combined, maker_of = {}, {}
     for idx, col in enumerate(columns):
-        for code, (name, price) in col["_items"].items():
+        for code, item in col["_items"].items():
+            name, price = item[0], item[1]
+            maker = item[2] if len(item) > 2 else ""
             row = combined.setdefault(code, [name, [None] * len(columns)])
             if len(name) > len(row[0]):
                 row[0] = name
             row[1][idx] = price
+            if maker and code not in maker_of:
+                maker_of[code] = maker
+    makers, maker_index = [], {}
+    for code, maker in maker_of.items():
+        if maker not in maker_index:
+            maker_index[maker] = len(makers)
+            makers.append(maker)
+        combined[code].append(maker_index[maker])
 
     # Sales: a shared table [store index, text, end date, club only] and, per barcode, which rows apply.
     promo_table, promo_index, item_promos = [], {}, {}
@@ -731,6 +756,7 @@ async def main():
         "updated": datetime.now(timezone.utc).isoformat(timespec="minutes"),
         "stores": [{k: v for k, v in c.items() if not k.startswith("_")} for c in columns],
         "items": combined,
+        "makers": makers,
         "promos": promo_table,
         "itemPromos": item_promos,
     }
