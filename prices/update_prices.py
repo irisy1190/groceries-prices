@@ -319,13 +319,17 @@ def read_prices(folder, chain_id=""):
         if same_chain:
             full = same_chain
     if not full:
-        return None, {}
+        return None, {}, []
     latest = max(full, key=lambda f: (file_date(f), os.path.getsize(f)))
     items = {}
+    weighed = []  # produce, cheese counter etc.: sold by weight, under the store's own short codes
     recs = records(latest, "itemcode")
     dropped = {"short code": 0, "no price": 0}
     for rec in recs:
         code = re.sub(r"\D", "", rec.get("itemcode", ""))
+        w = weighed_item(rec, code)
+        if w:
+            weighed.append(w)
         # Real barcodes have 8+ digits. Shorter codes are the store's own (weighed produce etc.)
         # and don't match across chains. (ItemType isn't used: some chains mark every item 0.)
         if len(code) < 8:
@@ -342,7 +346,32 @@ def read_prices(folder, chain_id=""):
         maker = clean_maker(rec.get("manufacturername", "") or rec.get("manufacturename", ""))
         items[code] = (name, price, maker)
     diagnose(latest, recs, items, dropped)
-    return latest, items
+    log(f"   {len(weighed)} items sold by weight")
+    return latest, items, weighed
+
+
+def weight_unit(rec):
+    """'kg' or '100g' when the price is per weight, else ''."""
+    unit = (rec.get("unitofmeasure", "") + " " + rec.get("unitqty", "")).lower()
+    if re.search(r"100\s*(גרם|ג'|ג\b|gr|g\b)", unit):
+        return "100g"
+    if re.search(r'קילו|ק"ג|ק״ג|קג|kg|kilo', unit):
+        return "kg"
+    return ""
+
+
+def weighed_item(rec, code):
+    """(code, name, price, unit) for something sold by weight, else None.
+    Weighed goods use the store's own short codes, so they're matched across stores by name in the app."""
+    is_weighed = str(rec.get("bisweighted", "")).strip() in ("1", "true", "True")
+    unit = weight_unit(rec)
+    if not (is_weighed or (len(code) < 8 and unit)):
+        return None
+    price = to_price(rec.get("itemprice"))
+    name = (rec.get("itemname", "") or rec.get("manufactureritemdescription", "")).strip()
+    if price is None or not name or not code:
+        return None
+    return (code, name, price, unit or "kg")
 
 
 def diagnose(path, recs, items, dropped):
@@ -531,6 +560,16 @@ def load_previous():
         return None
 
 
+def previous_weighed(prev, label):
+    """This store's sold-by-weight items from an earlier prices.json (or the Mac's)."""
+    if not prev:
+        return []
+    idx = next((i for i, st in enumerate(prev.get("stores", [])) if st.get("label") == label), None)
+    if idx is None:
+        return []
+    return [tuple(w[1:]) for w in prev.get("weighed", []) if w and w[0] == idx]
+
+
 def previous_column(prev, label):
     if not prev:
         return None, {}
@@ -636,7 +675,8 @@ async def main():
             if items:
                 columns.append({
                     "label": label, "place": target["place"], "branch": store.get("branch", ""),
-                    "date": store.get("date", ""), "stale": stale, "_items": items, "_promos": promos
+                    "date": store.get("date", ""), "stale": stale, "_items": items, "_promos": promos,
+                    "_weighed": previous_weighed(mac, label) or previous_weighed(prev, label)
                 })
                 entry.update(ok=not stale, items=len(items), promos=len(promos), how_chosen=how, file_date=store.get("date", ""),
                              branch={"id": "", "name": store.get("branch", ""), "address": ""})
@@ -679,7 +719,7 @@ async def main():
 
             folder = os.path.join(DUMPS, scraper, f"prices-{branch['id']}")
             await download(scraper, folder, "PRICE_FULL_FILE", store_id=branch["id"])
-            source, items = read_prices(folder, branch.get("chain", ""))
+            source, items, weighed = read_prices(folder, branch.get("chain", ""))
             if not items:
                 raise RuntimeError("no price file found for this branch (maybe blocked outside Israel)")
             entry.update(ok=True, items=len(items), file=os.path.basename(source), file_date=file_date(source))
@@ -689,6 +729,7 @@ async def main():
                 "branch": branch["name"], "date": file_date(source), "stale": False
             })
             columns[-1]["_items"] = items
+            columns[-1]["_weighed"] = weighed
             # Today's sales for this branch (a problem here never loses the prices).
             try:
                 promo_folder = os.path.join(DUMPS, scraper, f"promos-{branch['id']}")
@@ -714,7 +755,8 @@ async def main():
                 columns.append({
                     "label": label, "place": target["place"],
                     "branch": old_store.get("branch", ""), "date": old_store.get("date", ""), "stale": True,
-                    "_items": old_items, "_promos": previous_promos(prev, label)
+                    "_items": old_items, "_promos": previous_promos(prev, label),
+                    "_weighed": previous_weighed(prev, label)
                 })
                 entry["kept_previous"] = old_store.get("date")
         entry["seconds"] = round(time.time() - started)
@@ -759,6 +801,8 @@ async def main():
         "stores": [{k: v for k, v in c.items() if not k.startswith("_")} for c in columns],
         "items": combined,
         "makers": makers,
+        # Sold by weight: [store index, store's code, name, price, "kg" | "100g"] – matched by name in the app.
+        "weighed": [[idx, *w] for idx, col in enumerate(columns) for w in col.get("_weighed", [])],
         "promos": promo_table,
         "itemPromos": item_promos,
     }
