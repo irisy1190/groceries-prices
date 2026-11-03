@@ -221,7 +221,65 @@ async def download(scraper_name, folder, file_type, store_id=None):
                 log(f"   download problem: {err}")
         return count
 
-    return await asyncio.wait_for(run(), timeout=STEP_TIMEOUT)
+    result = await asyncio.wait_for(run(), timeout=STEP_TIMEOUT)
+    # Super-Pharm's site started refusing the library's downloads (HTTP 491) in Nov 2026, while a browser still
+    # gets the same files. If nothing arrived, fetch them the way a browser does.
+    if scraper_name == "SUPER_PHARM" and store_id and not xml_files(folder) and file_type in SUPERPHARM_CATEGORY:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(superpharm_direct, folder, file_type, int(store_id)), timeout=STEP_TIMEOUT)
+        except Exception as err:  # noqa: BLE001
+            log(f"   direct Super-Pharm download failed: {err!r}")
+    return result
+
+
+SUPERPHARM_CATEGORY = {"PRICE_FULL_FILE": "PriceFull", "PROMO_FULL_FILE": "PromoFull"}
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
+}
+
+
+def superpharm_direct(folder, file_type, store_id):
+    """Finds this branch's newest file on prices.super-pharm.co.il page by page, and downloads it like a browser."""
+    import gzip
+    import time
+    import requests
+
+    category = SUPERPHARM_CATEGORY[file_type]
+    base = "https://prices.super-pharm.co.il"
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    pattern = re.compile(r'/Download/%s\d+-\d+-%03d-(\d{8})-(\d{6})\.gz\?[^"\'<>\s]*' % (category, store_id))
+    best = None
+    for page in range(1, 80):
+        res = session.get(f"{base}/?Category-equals={category}&page={page}", timeout=30)
+        if res.status_code != 200:
+            log(f"   Super-Pharm list page {page}: HTTP {res.status_code}")
+            break
+        found = [(m.group(1) + m.group(2), m.group(0).replace("&amp;", "&")) for m in pattern.finditer(res.text)]
+        if found:
+            best = max(found)
+            break  # the list is newest first, so the first page that has this branch has its newest file
+        if "Download/" not in res.text:
+            break  # past the last page
+        time.sleep(0.4)
+    if not best:
+        log(f"   Super-Pharm: no {category} file listed for branch {store_id}")
+        return
+    url = base + best[1]
+    res = session.get(url, timeout=120, headers={"Referer": f"{base}/?Category-equals={category}"})
+    res.raise_for_status()
+    data = res.content
+    try:
+        data = gzip.decompress(data)
+    except OSError:
+        pass  # already plain XML
+    name = best[1].split("/Download/")[1].split(".gz")[0] + ".xml"
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, name), "wb") as fh:
+        fh.write(data)
+    log(f"   Super-Pharm: downloaded {name} directly ({len(data) // 1024} KB)")
 
 
 # ---------------------------------------------------------------------------
