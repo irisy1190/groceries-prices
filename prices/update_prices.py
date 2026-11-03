@@ -222,9 +222,9 @@ async def download(scraper_name, folder, file_type, store_id=None):
         return count
 
     result = await asyncio.wait_for(run(), timeout=STEP_TIMEOUT)
-    # Super-Pharm's site started refusing the library's downloads (HTTP 491) in Nov 2026, while a browser still
-    # gets the same files. If nothing arrived, fetch them the way a browser does.
-    if scraper_name == "SUPER_PHARM" and store_id and not xml_files(folder) and file_type in SUPERPHARM_CATEGORY:
+    # Super-Pharm's site refuses many of the library's downloads (HTTP 491) since Nov 2026, often today's file,
+    # while a browser gets them fine. So also fetch the newest file the way a browser does (the newest file wins).
+    if scraper_name == "SUPER_PHARM" and store_id and file_type in SUPERPHARM_CATEGORY:
         try:
             await asyncio.wait_for(asyncio.to_thread(superpharm_direct, folder, file_type, int(store_id)), timeout=STEP_TIMEOUT)
         except Exception as err:  # noqa: BLE001
@@ -266,6 +266,10 @@ def superpharm_direct(folder, file_type, store_id):
         time.sleep(0.4)
     if not best:
         log(f"   Super-Pharm: no {category} file listed for branch {store_id}")
+        return
+    newest = best[1].split("/Download/")[1].split(".gz")[0] + ".xml"
+    if any(os.path.basename(f) == newest for f in xml_files(folder)):
+        log(f"   Super-Pharm: newest file {newest} already downloaded")
         return
     url = base + best[1]
     res = session.get(url, timeout=120, headers={"Referer": f"{base}/?Category-equals={category}"})
