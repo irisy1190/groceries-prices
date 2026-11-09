@@ -127,7 +127,7 @@ def enrich(combined, log, earlier=None):
     todo.sort(key=lambda c: (not FIRST.search(combined[c][0]), -stores(c)))
 
     models = [os.environ["GEMINI_MODEL"]] if os.environ.get("GEMINI_MODEL") else list(MODELS)
-    added, calls = 0, 0
+    added, calls, busy = 0, 0, 0
     log(f"Search tags: {len(todo)} products without tags; tagging up to {MAX_CALLS * BATCH} today.")
     for start in range(0, len(todo), BATCH):
         if calls >= MAX_CALLS:
@@ -149,7 +149,21 @@ def enrich(combined, log, earlier=None):
                     log(f"   model {models[0]} not available, trying the next one")
                     models.pop(0)
                     continue
-                log(f"   tagging request failed: {err}")
+                if any(f"HTTP {c}" in msg for c in (500, 502, 503, 504)):
+                    # Busy right now: wait and retry; after two busy replies, move to the next model.
+                    busy += 1
+                    if busy % 2 == 0 and len(models) > 1:
+                        log(f"   {models[0]} is busy, switching to {models[1]}")
+                        models.append(models.pop(0))
+                    else:
+                        log(f"   {models[0]} is busy, retrying in 20 seconds")
+                        time.sleep(20)
+                    if busy >= 12:
+                        log("   Gemini stays busy – stopping for today.")
+                        log(f"Search tags: added {added} this run, {len(tags)} in total.")
+                        return tags
+                    continue
+                log(f"   tagging request failed: {msg[:200]}")
                 result = []
             except Exception as err:  # noqa: BLE001
                 log(f"   tagging reply could not be read: {err!r}")
