@@ -23,8 +23,9 @@ API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateC
 # Tried in order; the first one this key can use is kept for the run. Override with GEMINI_MODEL.
 MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash"]
 
-BATCH = int(os.environ.get("ENRICH_BATCH", "120"))        # products per request
-MAX_CALLS = int(os.environ.get("ENRICH_MAX_CALLS", "40"))  # requests per run (free tier has a daily cap)
+BATCH = int(os.environ.get("ENRICH_BATCH", "50"))         # products per request
+MAX_CALLS = int(os.environ.get("ENRICH_MAX_CALLS", "80"))  # requests per run (free tier has a daily cap)
+MINUTES = float(os.environ.get("ENRICH_MINUTES", "15"))    # time budget per run, so the prices always get published
 PAUSE = float(os.environ.get("ENRICH_PAUSE", "13"))        # seconds between requests (free tier ~5 per minute)
 
 # Dairy first, so protein yogurts and friends are searchable after the first run.
@@ -86,13 +87,15 @@ def _call(model, key, names):
         API.format(model=model), data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120) as res:
+        with urllib.request.urlopen(req, timeout=60) as res:
             reply = json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", "replace")[:300]
         if err.code == 429:
             raise RateLimited(detail) from err
         raise RuntimeError(f"HTTP {err.code}: {detail}") from err
+    except (TimeoutError, urllib.error.URLError, OSError) as err:
+        raise RuntimeError(f"HTTP 504: no answer ({err})") from err
     text = "".join(p.get("text", "") for p in reply["candidates"][0]["content"]["parts"])
     return json.loads(text)
 
@@ -128,9 +131,13 @@ def enrich(combined, log, earlier=None):
 
     models = [os.environ["GEMINI_MODEL"]] if os.environ.get("GEMINI_MODEL") else list(MODELS)
     added, calls, busy = 0, 0, 0
+    deadline = time.time() + MINUTES * 60
     log(f"Search tags: {len(todo)} products without tags; tagging up to {MAX_CALLS * BATCH} today.")
     for start in range(0, len(todo), BATCH):
         if calls >= MAX_CALLS:
+            break
+        if time.time() > deadline:
+            log(f"   time budget ({MINUTES:g} min) used – continuing tomorrow.")
             break
         batch = todo[start:start + BATCH]
         names = [combined[c][0] for c in batch]
@@ -158,7 +165,7 @@ def enrich(combined, log, earlier=None):
                     else:
                         log(f"   {models[0]} is busy, retrying in 20 seconds")
                         time.sleep(20)
-                    if busy >= 12:
+                    if busy >= 12 or time.time() > deadline:
                         log("   Gemini stays busy – stopping for today.")
                         log(f"Search tags: added {added} this run, {len(tags)} in total.")
                         return tags
