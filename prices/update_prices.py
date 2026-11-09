@@ -845,6 +845,14 @@ async def main():
             makers.append(maker)
         combined[code].append(maker_index[maker])
 
+    # Search tags written by an LLM, kept by barcode (see enrich.py). A problem here never loses the prices.
+    try:
+        from enrich import enrich
+        all_tags = enrich(combined, log, (prev or {}).get("tags"))
+    except Exception as err:  # noqa: BLE001
+        log(f"Search tags skipped: {err!r}")
+        all_tags = (prev or {}).get("tags") or {}
+
     # Sales: a shared table [store index, text, end date, club only] and, per barcode, which rows apply.
     promo_table, promo_index, item_promos = [], {}, {}
     for idx, col in enumerate(columns):
@@ -867,11 +875,16 @@ async def main():
         "weighed": [[idx, *w] for idx, col in enumerate(columns) for w in col.get("_weighed", [])],
         "promos": promo_table,
         "itemPromos": item_promos,
+        # Search words per barcode: { barcode: "יוגורט מוצרי חלב חלבון טבעי yogurt protein" }
+        "tags": {code: all_tags[code] for code in combined if code in all_tags},
     }
     with open(os.path.join(SITE, "prices.json"), "w", encoding="utf-8") as fh:
         json.dump(out, fh, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(SITE, "report.json"), "w", encoding="utf-8") as fh:
         json.dump({"updated": out["updated"], "stores": report, "log": log_lines}, fh, ensure_ascii=False, indent=1)
+    if all_tags:
+        with open(os.path.join(SITE, "tags.json"), "w", encoding="utf-8") as fh:
+            json.dump({"updated": out["updated"], "tags": all_tags}, fh, ensure_ascii=False, separators=(",", ":"))
     write_status_page(out, report)
 
     ok = sum(1 for r in report if r["ok"])
@@ -907,7 +920,7 @@ def write_status_page(out, report):
 table{{border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;width:100%}}
 td,th{{padding:10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
 small{{color:#8a8a8e}}</style></head><body>
-<h1>Grocery prices</h1><p>Last update: {esc(out['updated'])} (UTC) · {len(out['items'])} products</p>
+<h1>Grocery prices</h1><p>Last update: {esc(out['updated'])} (UTC) · {len(out['items'])} products · {len(out.get('tags', {}))} with search tags</p>
 <table><tr><th>Store</th><th>Status</th><th>Branch used</th><th>Products</th><th>On sale</th></tr>{''.join(rows)}</table>
 <p><small>The app reads <a href="prices.json">prices.json</a>. Details: <a href="report.json">report.json</a>.</small></p>
 </body></html>"""
