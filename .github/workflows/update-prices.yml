@@ -22,9 +22,6 @@ jobs:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +52,21 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
+
+  # Publishing is its own job: since Nov 2026 GitHub sometimes can't find the page files when the
+  # publish step runs a split second after they're uploaded in the same job ("No artifacts named
+  # github-pages were found"). A separate job starts later, and if it ever fails, "Re-run failed jobs"
+  # publishes the same files again without downloading the prices again.
+  deploy:
+    needs: update
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Give GitHub a moment to list the uploaded files
+        run: sleep 20
 
       - id: deployment
         uses: actions/deploy-pages@v4
